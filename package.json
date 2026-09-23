@@ -1,0 +1,17 @@
+{
+  "name": "espos-chat-bridge",
+  "version": "1.0.0",
+  "description": "EspOS EspCHAT WhatsApp Cloud Bridge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^8.19.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
