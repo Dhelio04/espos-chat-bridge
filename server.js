@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.4.0 - Live Presence, Real fromMe, On-Demand Sync & PTT Voice Notes
+ * EspOS EspCHAT Cloud Bridge v2.5.0 - Real Group Names, Persistent Store, Precision Presence & Strict LID/JID Mapping
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -34,6 +34,83 @@ let lidToJid = new Map();     // LID -> JID
 let jidToLid = new Map();     // JID -> LID
 let presenceMap = new Map();  // JID -> { status: "available"|"composing"|..., t: number }
 let callsList = [];
+
+// Persistencia en disco para que reinicios o redeploys nunca borren nombres ni historiales
+const storeFile = path.join(__dirname, "espos_store.json");
+
+function cargarStoreDisco() {
+  try {
+    if (fs.existsSync(storeFile)) {
+      const data = JSON.parse(fs.readFileSync(storeFile, "utf-8"));
+      if (data.contacts) {
+        for (const [k, v] of Object.entries(data.contacts)) contactsMap.set(k, v);
+      }
+      if (data.lidToJid) {
+        for (const [k, v] of Object.entries(data.lidToJid)) lidToJid.set(k, v);
+      }
+      if (data.jidToLid) {
+        for (const [k, v] of Object.entries(data.jidToLid)) jidToLid.set(k, v);
+      }
+      if (data.chats) {
+        for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
+      }
+      if (data.messages) {
+        for (const [k, v] of Object.entries(data.messages)) messagesCache.set(k, v);
+      }
+      console.log(`[Store] Restaurado desde disco: ${chatsCache.size} chats, ${messagesCache.size} historiales, ${contactsMap.size} contactos.`);
+    }
+  } catch (e) {
+    console.error("[Store] Error cargando store de disco:", e.message);
+  }
+}
+cargarStoreDisco();
+
+let guardarTimer = null;
+function programarGuardadoDisco() {
+  if (guardarTimer) clearTimeout(guardarTimer);
+  guardarTimer = setTimeout(() => {
+    try {
+      const payload = {
+        contacts: Object.fromEntries(contactsMap.entries()),
+        lidToJid: Object.fromEntries(lidToJid.entries()),
+        jidToLid: Object.fromEntries(jidToLid.entries()),
+        chats: Object.fromEntries(chatsCache.entries()),
+        messages: Object.fromEntries(messagesCache.entries())
+      };
+      fs.writeFileSync(storeFile, JSON.stringify(payload));
+    } catch (e) {
+      console.error("[Store] Error guardando store en disco:", e.message);
+    }
+  }, 2000);
+}
+
+async function sincronizarGruposReales() {
+  if (!sock) return;
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    for (const [gid, gdata] of Object.entries(groups)) {
+      if (gdata.subject) {
+        contactsMap.set(gid, gdata.subject);
+        if (chatsCache.has(gid)) {
+          chatsCache.get(gid).name = gdata.subject;
+        } else {
+          chatsCache.set(gid, {
+            id: gid,
+            name: gdata.subject,
+            lastMsg: "",
+            time: "",
+            unread: 0,
+            timestamp: Math.floor(Date.now() / 1000)
+          });
+        }
+      }
+    }
+    console.log(`[WhatsApp] ${Object.keys(groups).length} grupos sincronizados con sus nombres reales.`);
+    programarGuardadoDisco();
+  } catch (ge) {
+    console.error("[WhatsApp] Error obteniendo grupos:", ge.message);
+  }
+}
 
 function formatearHora(ts) {
   if (!ts) return "";
@@ -109,19 +186,38 @@ function extraerTexto(raw) {
 
 function resolverNombre(jid, pushName, fromMe) {
   if (!jid) return "Contacto";
-  if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (T)";
+  if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
   
-  // 1. Agenda telefonica o LID mapeado
-  const guardado = contactsMap.get(jid) || (lidToJid.has(jid) ? contactsMap.get(lidToJid.get(jid)) : null) || (jidToLid.has(jid) ? contactsMap.get(jidToLid.get(jid)) : null);
-  if (guardado && guardado !== myName && !guardado.startsWith("Contacto WA") && !guardado.startsWith("+")) return guardado;
+  // 1. Agenda telefónica o LID mapeado
+  const alt = lidToJid.get(jid) || jidToLid.get(jid);
+  const guardado = contactsMap.get(jid) || (alt ? contactsMap.get(alt) : null);
+  if (guardado && guardado !== myName && !guardado.startsWith("Contacto WA") && !guardado.startsWith("Comunidad #") && !guardado.startsWith("+")) {
+    return guardado;
+  }
 
   // 2. Nombre de perfil asignado por el emisor (pushName)
   if (!fromMe && pushName && pushName !== myName) {
     contactsMap.set(jid, pushName);
+    if (alt) contactsMap.set(alt, pushName);
+    programarGuardadoDisco();
     return pushName;
   }
 
-  // 3. Fallback legible
+  // 3. Preservar nombre previo en chatsCache si ya era un nombre real
+  if (chatsCache.has(jid)) {
+    const cName = chatsCache.get(jid).name;
+    if (cName && !cName.startsWith("Contacto WA") && !cName.startsWith("Comunidad #") && !cName.startsWith("+")) {
+      return cName;
+    }
+  }
+  if (alt && chatsCache.has(alt)) {
+    const cName = chatsCache.get(alt).name;
+    if (cName && !cName.startsWith("Contacto WA") && !cName.startsWith("Comunidad #") && !cName.startsWith("+")) {
+      return cName;
+    }
+  }
+
+  // 4. Fallback legible
   const base = jid.split("@")[0];
   if (jid.endsWith("@g.us")) return "Comunidad #" + base.slice(0, 6);
   if (jid.endsWith("@lid") || base.length > 12) return "Contacto WA  " + base.slice(-4);
@@ -135,9 +231,13 @@ function guardarContacto(c) {
     lidToJid.set(c.lid, c.id);
     jidToLid.set(c.id, c.lid);
   }
-  if (!nom || nom === myName) return;
-  if (c.id) contactsMap.set(c.id, nom);
-  if (c.lid) contactsMap.set(c.lid, nom);
+  if (nom && nom !== myName) {
+    if (c.id) contactsMap.set(c.id, nom);
+    if (c.lid) contactsMap.set(c.lid, nom);
+    if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
+    if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
+    programarGuardadoDisco();
+  }
 }
 
 function procesarMensaje(msg, esEnVivo = true) {
@@ -259,6 +359,7 @@ async function startWhatsApp() {
       myNumber = sock.user.id.split(":")[0];
       myName = sock.user.name || "Gab";
       console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber})`);
+      sincronizarGruposReales();
     }
   });
 
@@ -276,7 +377,7 @@ async function startWhatsApp() {
           chatsCache.set(c.id, {
             id: c.id,
             name: nom,
-            lastMsg: "Toca para abrir conversacin",
+            lastMsg: "",
             time: ts ? formatearHora(ts) : "",
             unread: c.unreadCount || 0,
             timestamp: ts
@@ -302,7 +403,7 @@ async function startWhatsApp() {
         chatsCache.set(c.id, {
           id: c.id,
           name: nom,
-          lastMsg: "Toca para abrir conversacin",
+          lastMsg: "",
           time: ts ? formatearHora(ts) : "",
           unread: c.unreadCount || 0,
           timestamp: ts
@@ -341,10 +442,16 @@ async function startWhatsApp() {
     if (!presences) return;
     for (const [sender, p] of Object.entries(presences)) {
       const j = id || sender;
-      const st = p.lastKnownPresence || (p.available ? "available" : "unavailable");
-      presenceMap.set(j, { status: st, t: Date.now() });
-      const alt = lidToJid.get(j) || jidToLid.get(j);
-      if (alt) presenceMap.set(alt, { status: st, t: Date.now() });
+      const st = p.lastKnownPresence;
+      if (st === "available" || st === "composing" || st === "recording") {
+        presenceMap.set(j, { status: st, t: Date.now() });
+        const alt = lidToJid.get(j) || jidToLid.get(j);
+        if (alt) presenceMap.set(alt, { status: st, t: Date.now() });
+      } else if (st === "unavailable") {
+        presenceMap.set(j, { status: "unavailable", t: 0 });
+        const alt = lidToJid.get(j) || jidToLid.get(j);
+        if (alt) presenceMap.set(alt, { status: "unavailable", t: 0 });
+      }
     }
   });
 
@@ -457,6 +564,14 @@ const server = http.createServer(async (req, res) => {
 
     const list = [];
     for (const c of sorted) {
+      const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
+      const realNom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null);
+      if (realNom && !realNom.startsWith("Contacto WA") && !realNom.startsWith("Comunidad #")) {
+        c.name = realNom;
+      }
+      if (c.lastMsg && (c.lastMsg.includes("Toca para abrir") || c.lastMsg.includes("Conversaci"))) {
+        c.lastMsg = "";
+      }
       const peer = lidToJid.get(c.id) || jidToLid.get(c.id) || c.id;
       if (vistanombres.has(peer) || vistanombres.has(c.id)) continue;
 
@@ -538,15 +653,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
 
-    // Resolver presencia en tiempo real
+    // Resolver presencia en tiempo real con precision One UI (cero falsos 'en linea')
     let presStr = "";
     const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
     const pInfo = presenceMap.get(chatJid) || (pAlt ? presenceMap.get(pAlt) : null);
-    if (pInfo) {
-      if (pInfo.status === "available") presStr = "En línea";
-      else if (pInfo.status === "composing") presStr = "Escribiendo...";
-      else if (pInfo.status === "recording") presStr = "Grabando audio...";
-      else if (Date.now() - pInfo.t < 60000) presStr = "En línea";
+    if (pInfo && pInfo.status) {
+      if (pInfo.status === "composing") {
+        presStr = "Escribiendo...";
+      } else if (pInfo.status === "recording") {
+        presStr = "Grabando audio...";
+      } else if (pInfo.status === "available" && pInfo.t > 0 && (Date.now() - pInfo.t < 35000)) {
+        presStr = "En línea";
+      }
     }
 
     res.writeHead(200, { "Content-Type": "application/json" });
