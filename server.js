@@ -249,7 +249,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/api/chats" && req.method === "GET") {
     const list = Array.from(chatsCache.values())
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-      .slice(0, 30); // Devuelve hasta 30 chats ordenados cronológicamente
+      .slice(0, 50); // Devuelve hasta 30 chats ordenados cronológicamente
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ chats: list, llamadas: callsList }));
   }
