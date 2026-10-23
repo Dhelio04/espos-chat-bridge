@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.2 - Real WhatsApp lastSeen Fix & Zero WDT Avatares ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.5.3 - Send 24 Most Recent Messages & Precision Sync ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -691,6 +691,11 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
+
+    // Entregar siempre los 24 mensajes más recientes (los últimos en orden cronológico)
+    if (msgs.length > 24) {
+      msgs = msgs.slice(-24);
+    }
 
     // Resolver presencia en tiempo real con precisión One UI (cero falsos 'en linea')
     let presStr = "";
