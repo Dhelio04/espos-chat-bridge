@@ -1,12 +1,13 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.4 - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.5.5 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require("@whiskeysockets/baileys");
+const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
 const url = require("url");
@@ -20,7 +21,13 @@ try { sharp = require("sharp"); console.log("[Sharp] Motor de imagenes cargado c
 const PORT = process.env.PORT || 3000;
 const authFolder = path.join(__dirname, "auth_info_baileys");
 const avatarsFolder = path.join(__dirname, "avatars_cache");
+const stickersFolder = path.join(__dirname, "stickers_cache");
+const audioFolder = path.join(__dirname, "audio_cache");
 if (!fs.existsSync(avatarsFolder)) fs.mkdirSync(avatarsFolder, { recursive: true });
+if (!fs.existsSync(stickersFolder)) fs.mkdirSync(stickersFolder, { recursive: true });
+if (!fs.existsSync(audioFolder)) fs.mkdirSync(audioFolder, { recursive: true });
+
+const rawMediaMap = new Map(); // msgId -> WAMessage
 
 let sock = null;
 let isConnected = false;
@@ -72,18 +79,20 @@ function formatearUltimaVez(ts) {
   try {
     const d = new Date(ts);
     const ahora = new Date();
-    const esHoy = d.getDate() === ahora.getDate() && d.getMonth() === ahora.getMonth() && d.getFullYear() === ahora.getFullYear();
-    const pad = (n) => String(n).padStart(2, "0");
-    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    if (esHoy) {
-      return `últ. vez hoy a las ${hhmm}`;
+    const opcionesHora = { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Lima" };
+    const strHora = d.toLocaleTimeString("es-PE", opcionesHora);
+    const strFechaMsg = d.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
+    const strFechaHoy = ahora.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
+    if (strFechaMsg === strFechaHoy) {
+      return `ult. vez hoy a las ${strHora}`;
     }
-    const ayer = new Date(ahora.getTime() - 24 * 60 * 60 * 1000);
-    const esAyer = d.getDate() === ayer.getDate() && d.getMonth() === ayer.getMonth() && d.getFullYear() === ayer.getFullYear();
-    if (esAyer) {
-      return `últ. vez ayer a las ${hhmm}`;
+    const ayer = new Date(ahora.getTime() - 86400000);
+    const strFechaAyer = ayer.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
+    if (strFechaMsg === strFechaAyer) {
+      return `ult. vez ayer a las ${strHora}`;
     }
-    return `últ. vez ${pad(d.getDate())}/${pad(d.getMonth() + 1)} a las ${hhmm}`;
+    const strFechaCorta = d.toLocaleDateString("es-PE", { day: "2-digit", month: "2-digit", timeZone: "America/Lima" });
+    return `ult. vez el ${strFechaCorta} a las ${strHora}`;
   } catch (e) {
     return "";
   }
@@ -117,13 +126,25 @@ async function sincronizarGruposReales() {
         if (chatsCache.has(gid)) {
           chatsCache.get(gid).name = gdata.subject;
         } else {
+          let gTs = gdata.creation ? Number(gdata.creation) : 0;
+          let gLast = "";
+          let gTime = "";
+          if (messagesCache.has(gid)) {
+            const ms = messagesCache.get(gid);
+            if (ms.length > 0) {
+              const u = ms[ms.length - 1];
+              if (u.timestamp) gTs = u.timestamp;
+              if (u.text) gLast = u.text;
+              if (u.time) gTime = u.time;
+            }
+          }
           chatsCache.set(gid, {
             id: gid,
             name: gdata.subject,
-            lastMsg: "",
-            time: "",
+            lastMsg: gLast,
+            time: gTime,
             unread: 0,
-            timestamp: Math.floor(Date.now() / 1000)
+            timestamp: gTs
           });
         }
       }
@@ -267,6 +288,15 @@ function procesarMensaje(msg, esEnVivo = true) {
   if (!msg || !msg.message) return;
   const jid = msg.key?.remoteJid;
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
+
+  // Registrar en rawMediaMap si tiene sticker o audio para descarga bajo demanda
+  if (msg.key?.id && (msg.message.stickerMessage || msg.message.audioMessage || msg.message.imageMessage)) {
+    rawMediaMap.set(msg.key.id, msg);
+    if (rawMediaMap.size > 200) {
+      const k = rawMediaMap.keys().next().value;
+      rawMediaMap.delete(k);
+    }
+  }
 
   // Escudo Anti-Delete: detectar revocacion SOLO si el tipo es REVOKE (type 0)
   const raw = msg.message;
@@ -575,21 +605,21 @@ const server = http.createServer(async (req, res) => {
 
   // API Chats (Unificado, desduplicado total y clasificado)
   if (pathname === "/api/chats" && req.method === "GET") {
-    // Sincronizar chatsCache con el mensaje más reciente de messagesCache antes de ordenar
+    // Sincronizar chatsCache con el mensaje mas reciente de messagesCache antes de ordenar
     for (const [jid, mList] of messagesCache.entries()) {
       if (Array.isArray(mList) && mList.length > 0) {
         const ult = mList[mList.length - 1];
-        if (ult && ult.timestamp) {
-          const c = chatsCache.get(jid) || { id: jid };
-          if (ult.timestamp > (c.timestamp || 0)) {
-            c.timestamp = ult.timestamp;
-            c.time = ult.time || c.time;
-            if (ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
-              c.lastMsg = ult.text;
-            }
-            c.fromMe = Boolean(ult.fromMe);
-            chatsCache.set(jid, c);
+        if (ult) {
+          const c = chatsCache.get(jid) || { id: jid, name: contactsMap.get(jid) || resolverNombre(jid, "", false), unread: 0 };
+          if (ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
+            c.lastMsg = ult.text;
           }
+          if (ult.time) c.time = ult.time;
+          if (ult.timestamp && (!c.timestamp || ult.timestamp >= c.timestamp || !c.lastMsg)) {
+            c.timestamp = ult.timestamp;
+          }
+          c.fromMe = Boolean(ult.fromMe);
+          chatsCache.set(jid, c);
         }
       }
     }
@@ -731,7 +761,7 @@ const server = http.createServer(async (req, res) => {
       msgs = msgs.slice(-24);
     }
 
-    // Resolver presencia en tiempo real con precisión One UI (cero falsos 'en linea')
+    // Resolver presencia en tiempo real con precision One UI (cero falsos 'en linea')
     let presStr = "";
     if (!chatJid.endsWith("@g.us") && !chatJid.endsWith("@newsletter")) {
       const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
@@ -742,9 +772,18 @@ const server = http.createServer(async (req, res) => {
         } else if (pInfo.status === "recording") {
           presStr = "Grabando audio...";
         } else if (pInfo.status === "available" && pInfo.t > 0 && (Date.now() - pInfo.t < 35000)) {
-          presStr = "En línea";
+          presStr = "En linea";
         } else if (pInfo.lastSeen) {
           presStr = formatearUltimaVez(pInfo.lastSeen);
+        }
+      }
+      // Si no hay presencia activa, buscar la fecha del ultimo mensaje recibido de este contacto
+      if (!presStr) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (!msgs[i].fromMe && msgs[i].timestamp) {
+            presStr = formatearUltimaVez(msgs[i].timestamp * 1000);
+            break;
+          }
         }
       }
     }
@@ -831,6 +870,111 @@ const server = http.createServer(async (req, res) => {
       console.log(`[Avatar] Error al procesar ${chatJid}:`, e.message);
       res.writeHead(404);
       return res.end();
+    }
+  }
+
+  // Endpoint de Stickers Nativo One UI: entrega 64x64 RGB565 (8192 bytes) Little-Endian
+  if (pathname === "/api/sticker" && req.method === "GET") {
+    const msgId = parsedUrl.query.id;
+    if (!msgId) { res.writeHead(400); return res.end(); }
+    try {
+      const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const rawPath = path.join(stickersFolder, `${safeId}.raw`);
+      if (fs.existsSync(rawPath)) {
+        const rawBuf = fs.readFileSync(rawPath);
+        if (rawBuf.length === 64 * 64 * 2) {
+          res.writeHead(200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": rawBuf.length,
+            "Cache-Control": "public, max-age=604800"
+          });
+          return res.end(rawBuf);
+        }
+      }
+      const rawMsg = rawMediaMap.get(msgId);
+      if (!rawMsg) { res.writeHead(404); return res.end("Sticker no en memoria"); }
+      if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
+
+      const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+        logger: pino({ level: "silent" }),
+        reuploadRequest: sock?.updateMediaMessage
+      });
+      if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+
+      const rgbBuf = await sharp(mediaBuf)
+        .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
+        .raw()
+        .toBuffer();
+
+      const rgb565 = Buffer.alloc(64 * 64 * 2);
+      for (let i = 0; i < 64 * 64; i++) {
+        const r = rgbBuf[i * 3];
+        const g = rgbBuf[i * 3 + 1];
+        const b = rgbBuf[i * 3 + 2];
+        const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        rgb565.writeUInt16LE(c16, i * 2);
+      }
+      fs.writeFileSync(rawPath, rgb565);
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": rgb565.length,
+        "Cache-Control": "public, max-age=604800"
+      });
+      return res.end(rgb565);
+    } catch (se) {
+      console.error("[Sticker] Error procesando sticker:", se.message);
+      res.writeHead(500); return res.end();
+    }
+  }
+
+  // Endpoint de Audios / Notas de Voz: entrega 16 kHz Mono WAV PCM
+  if (pathname === "/api/audio" && req.method === "GET") {
+    const msgId = parsedUrl.query.id;
+    if (!msgId) { res.writeHead(400); return res.end(); }
+    try {
+      const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const wavPath = path.join(audioFolder, `${safeId}.wav`);
+      if (fs.existsSync(wavPath)) {
+        const wavStat = fs.statSync(wavPath);
+        res.writeHead(200, {
+          "Content-Type": "audio/wav",
+          "Content-Length": wavStat.size,
+          "Cache-Control": "public, max-age=604800"
+        });
+        const stream = fs.createReadStream(wavPath);
+        return stream.pipe(res);
+      }
+      const rawMsg = rawMediaMap.get(msgId);
+      if (!rawMsg) { res.writeHead(404); return res.end("Audio no en memoria"); }
+
+      const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+        logger: pino({ level: "silent" }),
+        reuploadRequest: sock?.updateMediaMessage
+      });
+      if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+
+      const oggPath = path.join(audioFolder, `${safeId}.ogg`);
+      fs.writeFileSync(oggPath, mediaBuf);
+
+      execFile("ffmpeg", ["-y", "-i", oggPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavPath], (err) => {
+        try { fs.unlinkSync(oggPath); } catch (e) {}
+        if (err || !fs.existsSync(wavPath)) {
+          console.error("[Audio] Error transcoding con ffmpeg:", err?.message);
+          res.writeHead(500); return res.end("Fallo transcodificacion");
+        }
+        const wavStat = fs.statSync(wavPath);
+        res.writeHead(200, {
+          "Content-Type": "audio/wav",
+          "Content-Length": wavStat.size,
+          "Cache-Control": "public, max-age=604800"
+        });
+        const stream = fs.createReadStream(wavPath);
+        stream.pipe(res);
+      });
+      return;
+    } catch (ae) {
+      console.error("[Audio] Error procesando audio:", ae.message);
+      res.writeHead(500); return res.end();
     }
   }
 
