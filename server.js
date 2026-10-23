@@ -35,14 +35,46 @@ let callsList = [];
 function formatearHora(ts) {
   if (!ts) return "";
   try {
+    const date = new Date(ts * 1000);
+    const ahora = new Date();
+    
+    const opcionesHora = { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Lima" };
+    const opcionesFecha = { day: "2-digit", month: "2-digit", year: "2-digit", timeZone: "America/Lima" };
+    const opcionesDiaSem = { weekday: "short", timeZone: "America/Lima" };
+
+    const strFechaMsg = date.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
+    const strFechaHoy = ahora.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
+    
+    const dMsg = new Date(strFechaMsg + "T12:00:00Z");
+    const dHoy = new Date(strFechaHoy + "T12:00:00Z");
+    const diffDias = Math.round((dHoy - dMsg) / (1000 * 60 * 60 * 24));
+
+    if (diffDias === 0) {
+      return date.toLocaleTimeString("es-PE", opcionesHora).replace(/\s+/g, " ");
+    } else if (diffDias === 1) {
+      return "Ayer";
+    } else if (diffDias > 1 && diffDias < 7) {
+      const dia = date.toLocaleDateString("es-PE", opcionesDiaSem);
+      return dia.charAt(0).toUpperCase() + dia.slice(1).replace(".", "");
+    } else {
+      return date.toLocaleDateString("es-PE", opcionesFecha);
+    }
+  } catch (e) {
+    return "";
+  }
+}
+
+function formatearHoraMensaje(ts) {
+  if (!ts) return "";
+  try {
     return new Date(ts * 1000).toLocaleTimeString("es-PE", {
-      hour: "2-digit",
+      hour: "numeric",
       minute: "2-digit",
       hour12: true,
       timeZone: "America/Lima"
-    });
+    }).replace(/\s+/g, " ");
   } catch (e) {
-    return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return "";
   }
 }
 
@@ -130,7 +162,7 @@ function procesarMensaje(msg, esEnVivo = true) {
   const fromMe = Boolean(msg.key?.fromMe);
   const rawTs = msg.messageTimestamp;
   const ts = rawTs ? (typeof rawTs === "number" ? rawTs : Number(rawTs.low || rawTs)) : Math.floor(Date.now() / 1000);
-  const timeStr = formatearHora(ts);
+  const timeStr = formatearHoraMensaje(ts);
 
   if (!messagesCache.has(jid)) messagesCache.set(jid, []);
   const hist = messagesCache.get(jid);
@@ -286,7 +318,14 @@ const server = http.createServer(async (req, res) => {
       .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0))
       .slice(0, 50);
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ chats: list, llamadas: callsList }));
+    return res.end(JSON.stringify({
+      conectado: isConnected,
+      usuario: myName,
+      numero: myNumber,
+      totalChats: chatsCache.size,
+      chats: list,
+      llamadas: callsList
+    }));
   }
 
   if (pathname === "/api/mensajes" && req.method === "GET") {
