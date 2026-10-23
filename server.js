@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.1 - Real WhatsApp Activity Presence ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.5.2 - Real WhatsApp lastSeen Fix & Zero WDT Avatares ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -268,15 +268,6 @@ function procesarMensaje(msg, esEnVivo = true) {
   const jid = msg.key?.remoteJid;
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
 
-  if (!fromMe && jid && !jid.endsWith("@g.us")) {
-    const mts = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
-    const curP = presenceMap.get(jid) || {};
-    curP.lastSeen = mts;
-    presenceMap.set(jid, curP);
-    const altJ = lidToJid.get(jid) || jidToLid.get(jid);
-    if (altJ) presenceMap.set(altJ, curP);
-  }
-
   // Escudo Anti-Delete: detectar revocacion SOLO si el tipo es REVOKE (type 0)
   const raw = msg.message;
   const proto = raw.protocolMessage || raw.ephemeralMessage?.message?.protocolMessage;
@@ -301,6 +292,15 @@ function procesarMensaje(msg, esEnVivo = true) {
 
   const fromMe = Boolean(msg.key?.fromMe);
   const rawTs = msg.messageTimestamp;
+  // Presencia: registrar timestamp del ultimo mensaje recibido para "ult. vez..."
+  if (!fromMe && !jid.endsWith("@g.us") && !jid.endsWith("@newsletter")) {
+    const msgTs = rawTs ? (typeof rawTs === "number" ? rawTs * 1000 : Number(rawTs.low || rawTs) * 1000) : Date.now();
+    const curP = presenceMap.get(jid) || {};
+    curP.lastSeen = msgTs;
+    presenceMap.set(jid, curP);
+    const altJid = lidToJid.get(jid) || jidToLid.get(jid);
+    if (altJid) presenceMap.set(altJid, Object.assign({}, curP));
+  }
   const ts = rawTs ? (typeof rawTs === "number" ? rawTs : Number(rawTs.low || rawTs)) : Math.floor(Date.now() / 1000);
   const timeStr = formatearHoraMensaje(ts);
   const timeRel = formatearHora(ts);
