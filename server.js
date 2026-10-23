@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.3.1 - Channel Routing, Total Dedup & View-Once Shield
+ * EspOS EspCHAT Cloud Bridge v2.3.2 - Real Read Receipts, Strict Anti-Delete & Zero Double-Tap
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -144,10 +144,10 @@ function procesarMensaje(msg, esEnVivo = true) {
   const jid = msg.key?.remoteJid;
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
 
-  // Escudo Anti-Delete: detectar revocacion
+  // Escudo Anti-Delete: detectar revocacion SOLO si el tipo es REVOKE (type 0)
   const raw = msg.message;
   const proto = raw.protocolMessage || raw.ephemeralMessage?.message?.protocolMessage;
-  if (proto && (proto.type === 0 || proto.key?.id)) {
+  if (proto && (proto.type === 0 || proto.type === "REVOKE")) {
     const targetId = proto.key?.id;
     if (targetId && messagesCache.has(jid)) {
       const lista = messagesCache.get(jid);
@@ -174,13 +174,17 @@ function procesarMensaje(msg, esEnVivo = true) {
 
   if (!messagesCache.has(jid)) messagesCache.set(jid, []);
   const lista = messagesCache.get(jid);
+  const mStatus = msg.status || (fromMe ? 2 : 0);
+  const isRead = Boolean(mStatus === 4 || mStatus === 5);
   lista.push({
     id: msg.key.id,
     fromMe,
     sender: msg.pushName || (fromMe ? "T" : "Contacto"),
     text,
     time: timeStr,
-    timestamp: ts
+    timestamp: ts,
+    status: mStatus,
+    read: isRead
   });
   if (lista.length > 50) lista.shift();
 
@@ -197,7 +201,8 @@ function procesarMensaje(msg, esEnVivo = true) {
       lastMsg: text,
       time: timeRel,
       unread,
-      timestamp: ts
+      timestamp: ts,
+      visto: fromMe ? false : true
     });
   } else if (prev && (!prev.name || prev.name.startsWith("Contacto WA") || prev.name.startsWith("+"))) {
     prev.name = name;
@@ -328,6 +333,27 @@ async function startWhatsApp() {
 
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     for (const m of messages) procesarMensaje(m, true);
+  });
+
+  sock.ev.on("messages.update", (updates) => {
+    for (const u of updates) {
+      const jid = u.key?.remoteJid;
+      const mid = u.key?.id;
+      if (!jid || !mid) continue;
+      const st = u.update?.status;
+      if (messagesCache.has(jid)) {
+        for (const item of messagesCache.get(jid)) {
+          if (item.id === mid) {
+            if (typeof st === "number") item.status = st;
+            if (st === 4 || st === 5) item.read = true;
+            break;
+          }
+        }
+      }
+      if (chatsCache.has(jid) && (st === 4 || st === 5)) {
+        chatsCache.get(jid).visto = true;
+      }
+    }
   });
 
   sock.ev.on("call", (calls) => {
