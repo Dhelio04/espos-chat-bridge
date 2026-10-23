@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.3.0 - Full Real-Time Sync & Native Avatars
+ * EspOS EspCHAT Cloud Bridge v2.3.1 - Channel Routing, Total Dedup & View-Once Shield
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -82,6 +82,7 @@ function formatearHoraMensaje(ts) {
 
 function extraerTexto(raw) {
   if (!raw) return "";
+  const isViewOnce = Boolean(raw.viewOnceMessage || raw.viewOnceMessageV2);
   let m = raw;
   if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
   if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
@@ -95,9 +96,9 @@ function extraerTexto(raw) {
   if (m.extendedTextMessage?.text && m.extendedTextMessage.text.trim()) return m.extendedTextMessage.text.trim();
   if (m.imageMessage?.caption) return m.imageMessage.caption.trim();
   if (m.videoMessage?.caption) return m.videoMessage.caption.trim();
-  if (m.imageMessage) return "[Foto]";
-  if (m.audioMessage) return "[Nota de voz]";
-  if (m.videoMessage) return "[Video]";
+  if (m.imageMessage) return isViewOnce ? "[Foto de 1 sola vez]" : (m.imageMessage.caption?.trim() || "[Foto]");
+  if (m.audioMessage) return isViewOnce ? "[Audio de 1 sola vez]" : "[Nota de voz]";
+  if (m.videoMessage) return isViewOnce ? "[Video de 1 sola vez]" : (m.videoMessage.caption?.trim() || "[Video]");
   if (m.documentMessage) return "[Documento: " + (m.documentMessage.fileName || "archivo") + "]";
   if (m.stickerMessage) return "[Sticker]";
   if (m.locationMessage) return "[Ubicacin]";
@@ -387,21 +388,55 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  // API Chats (Unificado y desduplicado)
+  // API Chats (Unificado, desduplicado total y clasificado)
   if (pathname === "/api/chats" && req.method === "GET") {
-    // Desduplicar LIDs y telefonos del mismo contacto
     const vistanombres = new Set();
     const sorted = Array.from(chatsCache.values())
       .filter(c => c && c.id)
       .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
 
+    // Primer paso: auto-asociar pares JID <-> LID que compartan nombre de agenda
+    for (const c of sorted) {
+      const isPersonal = !c.id.endsWith("@g.us") && !c.id.endsWith("@newsletter");
+      const nom = (c.name || "").trim().toLowerCase();
+      if (isPersonal && nom.length >= 3 && !nom.startsWith("contacto wa") && !nom.startsWith("+")) {
+        for (const c2 of sorted) {
+          if (c.id !== c2.id) {
+            const nom2 = (c2.name || "").trim().toLowerCase();
+            if (nom === nom2) {
+              const jidEntry = c.id.endsWith("@s.whatsapp.net") ? c.id : (c2.id.endsWith("@s.whatsapp.net") ? c2.id : null);
+              const lidEntry = c.id.endsWith("@lid") ? c.id : (c2.id.endsWith("@lid") ? c2.id : null);
+              if (jidEntry && lidEntry) {
+                lidToJid.set(lidEntry, jidEntry);
+                jidToLid.set(jidEntry, lidEntry);
+              }
+            }
+          }
+        }
+      }
+    }
+
     const list = [];
     for (const c of sorted) {
-      // Clave de desduplicacion: si tenemos mapped JID/LID
       const peer = lidToJid.get(c.id) || jidToLid.get(c.id) || c.id;
-      if (vistanombres.has(peer)) continue;
+      if (vistanombres.has(peer) || vistanombres.has(c.id)) continue;
+
+      const isPersonal = !c.id.endsWith("@g.us") && !c.id.endsWith("@newsletter");
+      const nom = (c.name || "").trim().toLowerCase();
+      const esNombreValido = isPersonal && nom.length >= 3 &&
+                             !nom.startsWith("contacto wa") &&
+                             !nom.startsWith("+") &&
+                             !nom.startsWith("comunidad");
+      if (esNombreValido && vistanombres.has("NOM:" + nom)) continue;
+
       vistanombres.add(peer);
       vistanombres.add(c.id);
+      if (esNombreValido) vistanombres.add("NOM:" + nom);
+      
+      // Indicar si es canal
+      if (c.id.endsWith("@newsletter")) {
+        c.esCanal = true;
+      }
       list.push(c);
       if (list.length >= 50) break;
     }
@@ -420,10 +455,39 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/api/mensajes" && req.method === "GET") {
     const chatJid = parsedUrl.query.chat;
     let msgs = messagesCache.get(chatJid) || [];
-    // Si no encontro por LID, intentar por JID mapeado o viceversa
     if (msgs.length === 0) {
       const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
       if (alt && messagesCache.has(alt)) msgs = messagesCache.get(alt);
+    }
+    // Si no hay mensajes, intentar buscar por otro chat con el mismo nombre
+    if (msgs.length === 0 && chatsCache.has(chatJid)) {
+      const cNom = (chatsCache.get(chatJid).name || "").trim().toLowerCase();
+      if (cNom.length >= 3 && !cNom.startsWith("contacto wa") && !cNom.startsWith("+")) {
+        for (const [otherJid, otherChat] of chatsCache.entries()) {
+          if (otherJid !== chatJid && (otherChat.name || "").trim().toLowerCase() === cNom) {
+            if (messagesCache.has(otherJid) && messagesCache.get(otherJid).length > 0) {
+              msgs = messagesCache.get(otherJid);
+              lidToJid.set(chatJid, otherJid);
+              jidToLid.set(otherJid, chatJid);
+              break;
+            }
+          }
+        }
+      }
+    }
+    // Si aun esta vacio pero chatsCache conserva el ultimo mensaje real, sintetizarlo
+    if (msgs.length === 0 && chatsCache.has(chatJid)) {
+      const info = chatsCache.get(chatJid);
+      if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
+        msgs = [{
+          id: "preview_" + (info.timestamp || Date.now()),
+          fromMe: false,
+          sender: info.name || "Contacto",
+          text: info.lastMsg,
+          time: info.time || "",
+          timestamp: info.timestamp || 0
+        }];
+      }
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -453,11 +517,15 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // 2. Pedir URL del avatar a WhatsApp (intentar con JID original y mapeado)
-      let ppUrl = await sock.profilePictureUrl(chatJid, "image").catch(() => null);
+      // 2. Pedir URL del avatar a WhatsApp con proteccion de timeout de 2.5s
+      const withTimeout = (p, ms) => Promise.race([
+        p,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+      ]);
+      let ppUrl = await withTimeout(sock.profilePictureUrl(chatJid, "image"), 2500).catch(() => null);
       if (!ppUrl) {
         const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
-        if (alt) ppUrl = await sock.profilePictureUrl(alt, "image").catch(() => null);
+        if (alt) ppUrl = await withTimeout(sock.profilePictureUrl(alt, "image"), 2500).catch(() => null);
       }
       if (!ppUrl) {
         res.writeHead(404); return res.end();
