@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const http = require("http");
 const url = require("url");
@@ -204,18 +204,25 @@ function procesarMensaje(msg, esEnVivo = true) {
 }
 
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-  const { version } = await fetchLatestBaileysVersion();
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+    let version = [2, 3000, 1015901307];
+    try {
+      const v = await fetchLatestBaileysVersion();
+      if (v && v.version) version = v.version;
+    } catch (ve) {
+      console.log("[Baileys] Usando version default de WA:", version);
+    }
 
-  sock = makeWASocket({
-    version,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    auth: state,
-    browser: Browsers.macOS("Chrome"),
-    syncFullHistory: true,
-    markOnlineOnConnect: true
-  });
+    sock = makeWASocket({
+      version,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      auth: state,
+      browser: ["EspOS microPC", "Chrome", "20.0.04"],
+      syncFullHistory: true,
+      markOnlineOnConnect: true
+    });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -338,6 +345,10 @@ async function startWhatsApp() {
       if (callsList.length > 20) callsList.pop();
     }
   });
+  } catch (err) {
+    console.error("[WhatsApp] Error critico en startWhatsApp:", err);
+    setTimeout(startWhatsApp, 3000);
+  }
 }
 
 const server = http.createServer(async (req, res) => {
