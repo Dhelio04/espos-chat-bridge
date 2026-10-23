@@ -1,9 +1,9 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.2.0 - One UI 8 Engine
- * - Sincronizacion completa de historial y 50 chats en orden cronologico estricto.
- * - Mapeo integral de contactos telefonicos y LIDs (@lid -> Nombre real de agenda).
- * - Zona horaria local (America/Lima, UTC-5) con formato 12h AM/PM exacto al movil.
- * - Motor de Avatares One UI 8: conversion nativa en servidor a 42x42 RGB565 (3528 bytes).
+ * EspOS EspCHAT Cloud Bridge v2.3.0 - Full Real-Time Sync & Native Avatars
+ * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
+ * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
+ * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
+ * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require("@whiskeysockets/baileys");
@@ -15,7 +15,7 @@ const path = require("path");
 const fs = require("fs");
 
 let sharp = null;
-try { sharp = require("sharp"); } catch (e) { console.log("[Sharp] No disponible aun, esperando instalacion"); }
+try { sharp = require("sharp"); console.log("[Sharp] Motor de imagenes cargado correctamente"); } catch (e) { console.log("[Sharp] No disponible aun"); }
 
 const PORT = process.env.PORT || 3000;
 const authFolder = path.join(__dirname, "auth_info_baileys");
@@ -29,7 +29,9 @@ let myName = "";
 let currentQR = "";
 let chatsCache = new Map();
 let messagesCache = new Map();
-let contactsMap = new Map(); // JID / LID -> Nombre guardado
+let contactsMap = new Map(); // JID / LID -> Nombre de agenda
+let lidToJid = new Map();     // LID -> JID
+let jidToLid = new Map();     // JID -> LID
 let callsList = [];
 
 function formatearHora(ts) {
@@ -98,18 +100,18 @@ function extraerTexto(raw) {
   if (m.videoMessage) return "[Video]";
   if (m.documentMessage) return "[Documento: " + (m.documentMessage.fileName || "archivo") + "]";
   if (m.stickerMessage) return "[Sticker]";
-  if (m.locationMessage) return "[Ubicación]";
+  if (m.locationMessage) return "[Ubicacin]";
   if (m.contactMessage) return "[Contacto]";
   return "";
 }
 
 function resolverNombre(jid, pushName, fromMe) {
   if (!jid) return "Contacto";
-  if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
+  if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (T)";
   
-  // 1. Agenda de contactos telefonica (incluyendo LIDs mapeados)
-  const guardado = contactsMap.get(jid);
-  if (guardado && guardado !== myName && !guardado.startsWith("Contacto WA")) return guardado;
+  // 1. Agenda telefonica o LID mapeado
+  const guardado = contactsMap.get(jid) || (lidToJid.has(jid) ? contactsMap.get(lidToJid.get(jid)) : null) || (jidToLid.has(jid) ? contactsMap.get(jidToLid.get(jid)) : null);
+  if (guardado && guardado !== myName && !guardado.startsWith("Contacto WA") && !guardado.startsWith("+")) return guardado;
 
   // 2. Nombre de perfil asignado por el emisor (pushName)
   if (!fromMe && pushName && pushName !== myName) {
@@ -120,13 +122,17 @@ function resolverNombre(jid, pushName, fromMe) {
   // 3. Fallback legible
   const base = jid.split("@")[0];
   if (jid.endsWith("@g.us")) return "Comunidad #" + base.slice(0, 6);
-  if (jid.endsWith("@lid") || base.length > 12) return "Contacto WA · " + base.slice(-4);
+  if (jid.endsWith("@lid") || base.length > 12) return "Contacto WA  " + base.slice(-4);
   return "+" + base;
 }
 
 function guardarContacto(c) {
   if (!c) return;
   const nom = c.name || c.notify || c.verifiedName;
+  if (c.id && c.lid) {
+    lidToJid.set(c.lid, c.id);
+    jidToLid.set(c.id, c.lid);
+  }
   if (!nom || nom === myName) return;
   if (c.id) contactsMap.set(c.id, nom);
   if (c.lid) contactsMap.set(c.lid, nom);
@@ -163,32 +169,36 @@ function procesarMensaje(msg, esEnVivo = true) {
   const rawTs = msg.messageTimestamp;
   const ts = rawTs ? (typeof rawTs === "number" ? rawTs : Number(rawTs.low || rawTs)) : Math.floor(Date.now() / 1000);
   const timeStr = formatearHoraMensaje(ts);
+  const timeRel = formatearHora(ts);
 
   if (!messagesCache.has(jid)) messagesCache.set(jid, []);
-  const hist = messagesCache.get(jid);
-  const msgId = msg.key?.id || String(ts);
-  if (!hist.some(x => x.id === msgId)) {
-    hist.push({ id: msgId, fromMe, deleted: false, text, time: timeStr, ts });
-    if (hist.length > 30) hist.shift();
-  }
+  const lista = messagesCache.get(jid);
+  lista.push({
+    id: msg.key.id,
+    fromMe,
+    sender: msg.pushName || (fromMe ? "T" : "Contacto"),
+    text,
+    time: timeStr,
+    timestamp: ts
+  });
+  if (lista.length > 50) lista.shift();
 
+  // Actualizar chatsCache
   const name = resolverNombre(jid, msg.pushName, fromMe);
   const prevUnread = chatsCache.has(jid) ? chatsCache.get(jid).unread : 0;
   const unread = fromMe ? 0 : (esEnVivo ? prevUnread + 1 : prevUnread);
 
-  // Solo actualizar snippet si este mensaje es igual o mas reciente que el existente
   const prev = chatsCache.get(jid);
   if (!prev || ts >= (prev.timestamp || 0)) {
     chatsCache.set(jid, {
       id: jid,
       name,
       lastMsg: text,
-      time: timeStr,
+      time: timeRel,
       unread,
       timestamp: ts
     });
   } else if (prev && (!prev.name || prev.name.startsWith("Contacto WA") || prev.name.startsWith("+"))) {
-    // Si tenemos un nombre mejor, actualizarlo sin alterar el snippet
     prev.name = name;
   }
 }
@@ -202,28 +212,38 @@ async function startWhatsApp() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
     auth: state,
-    browser: Browsers.ubuntu("Chrome"),
-    syncFullHistory: true
+    browser: Browsers.macOS("Chrome"),
+    syncFullHistory: true,
+    markOnlineOnConnect: true
   });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
     if (qr) {
-      try { currentQR = await QRCode.toDataURL(qr); } catch (e) {}
+      currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
+      isConnected = false;
     }
+
     if (connection === "close") {
       isConnected = false;
-      currentQR = "";
-      const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) setTimeout(startWhatsApp, 3000);
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`[WhatsApp] Conexin cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
+      if (shouldReconnect) {
+        setTimeout(startWhatsApp, 3000);
+      } else {
+        try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch (e) {}
+        setTimeout(startWhatsApp, 2000);
+      }
     } else if (connection === "open") {
       isConnected = true;
       currentQR = "";
-      myNumber = sock.user?.id ? sock.user.id.split(":")[0] : "";
-      myName = sock.user?.name || myNumber;
-      console.log(`[EspCHAT Cloud] Conectado como: ${myName} (${myNumber})`);
+      myNumber = sock.user.id.split(":")[0];
+      myName = sock.user.name || "Gab";
+      console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber})`);
     }
   });
 
@@ -235,12 +255,13 @@ async function startWhatsApp() {
       for (const c of chats) {
         if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
         const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
-        const ts = Number(c.conversationTimestamp?.low || c.conversationTimestamp || 0);
+        const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
+        const ts = Number(rawTs);
         if (!chatsCache.has(c.id)) {
           chatsCache.set(c.id, {
             id: c.id,
             name: nom,
-            lastMsg: "Toca para abrir conversación",
+            lastMsg: "Toca para abrir conversacin",
             time: ts ? formatearHora(ts) : "",
             unread: c.unreadCount || 0,
             timestamp: ts
@@ -252,6 +273,37 @@ async function startWhatsApp() {
       for (const m of messages) procesarMensaje(m, false);
     }
   });
+
+  // Manejo de actualizacion dinamica de chats en tiempo real
+  const onChatsUpdate = (chatsList) => {
+    if (!Array.isArray(chatsList)) return;
+    for (const c of chatsList) {
+      if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
+      const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
+      const ts = Number(rawTs);
+      const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
+      const prev = chatsCache.get(c.id);
+      if (!prev) {
+        chatsCache.set(c.id, {
+          id: c.id,
+          name: nom,
+          lastMsg: "Toca para abrir conversacin",
+          time: ts ? formatearHora(ts) : "",
+          unread: c.unreadCount || 0,
+          timestamp: ts
+        });
+      } else {
+        if (nom && nom !== prev.name && !nom.startsWith("+") && !nom.startsWith("Contacto")) prev.name = nom;
+        if (ts > (prev.timestamp || 0)) {
+          prev.timestamp = ts;
+          prev.time = formatearHora(ts);
+        }
+        if (typeof c.unreadCount === "number") prev.unread = c.unreadCount;
+      }
+    }
+  };
+  sock.ev.on("chats.upsert", onChatsUpdate);
+  sock.ev.on("chats.update", onChatsUpdate);
 
   const onContacts = (list) => {
     for (const c of list) {
@@ -266,41 +318,46 @@ async function startWhatsApp() {
   sock.ev.on("contacts.upsert", onContacts);
   sock.ev.on("contacts.update", onContacts);
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    for (const msg of messages) procesarMensaje(msg, true);
+  sock.ev.on("messages.upsert", ({ messages, type }) => {
+    for (const m of messages) procesarMensaje(m, true);
   });
 
-  sock.ev.on("call", (callEvents) => {
-    for (const ev of callEvents) {
-      const cid = ev.from || ev.chatId || "";
-      if (!cid) continue;
-      const timeStr = formatearHora(Math.floor(Date.now() / 1000));
+  sock.ev.on("call", (calls) => {
+    for (const c of calls) {
+      const ts = c.date ? Math.floor(new Date(c.date).getTime() / 1000) : Math.floor(Date.now() / 1000);
+      const cid = c.chatId || c.from;
       const name = contactsMap.get(cid) || resolverNombre(cid, "", false);
       callsList.unshift({
-        id: cid,
+        id: c.id,
+        chatId: cid,
         name,
-        time: timeStr,
-        missed: ev.status === "reject" || ev.status === "timeout" || ev.status === "offer",
-        video: Boolean(ev.isVideo)
+        time: formatearHora(ts),
+        status: c.status,
+        isVideo: Boolean(c.isVideo)
       });
-      if (callsList.length > 15) callsList.pop();
+      if (callsList.length > 20) callsList.pop();
     }
   });
 }
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  if (pathname === "/" || pathname === "/qr") {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  // Dashboard Web
+  if (pathname === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     if (isConnected) {
-      return res.end(`<!DOCTYPE html><html><body style="background:#090d12;color:white;text-align:center;padding:40px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #25d366;"><h2 style="color:#25d366;">&#10004; CONECTADO 24/7</h2><p>WhatsApp vinculado: <b>${myName}</b> (${myNumber})</p><p>Chats en memoria: <b>${chatsCache.size}</b></p></div></body></html>`);
+      return res.end(`<!DOCTYPE html><html><body style="background:#090d12;color:white;text-align:center;padding:40px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #25d366;"><h2 style="color:#25d366;">&#10004; CONECTADO 24/7</h2><p>WhatsApp vinculado: <b>${myName}</b> (${myNumber})</p><p>Chats activos: <b>${chatsCache.size}</b></p></div></body></html>`);
     } else if (currentQR) {
       return res.end(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="6"></head><body style="background:#090d12;color:white;text-align:center;padding:40px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #38bdf8;"><h2>Vincular WhatsApp a EspOS</h2><img src="${currentQR}" style="width:260px;height:260px;background:white;padding:10px;border-radius:12px;"><p>Escanea desde WhatsApp &gt; Dispositivos vinculados</p></div></body></html>`);
     } else {
@@ -308,15 +365,36 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // API Status
   if (pathname === "/api/status" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ conectado: isConnected, usuario: myName, numero: myNumber, totalChats: chatsCache.size }));
+    return res.end(JSON.stringify({
+      conectado: isConnected,
+      usuario: myName,
+      numero: myNumber,
+      totalChats: chatsCache.size
+    }));
   }
 
+  // API Chats (Unificado y desduplicado)
   if (pathname === "/api/chats" && req.method === "GET") {
-    const list = Array.from(chatsCache.values())
-      .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0))
-      .slice(0, 50);
+    // Desduplicar LIDs y telefonos del mismo contacto
+    const vistanombres = new Set();
+    const sorted = Array.from(chatsCache.values())
+      .filter(c => c && c.id)
+      .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+
+    const list = [];
+    for (const c of sorted) {
+      // Clave de desduplicacion: si tenemos mapped JID/LID
+      const peer = lidToJid.get(c.id) || jidToLid.get(c.id) || c.id;
+      if (vistanombres.has(peer)) continue;
+      vistanombres.add(peer);
+      vistanombres.add(c.id);
+      list.push(c);
+      if (list.length >= 50) break;
+    }
+
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       conectado: isConnected,
@@ -330,13 +408,18 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === "/api/mensajes" && req.method === "GET") {
     const chatJid = parsedUrl.query.chat;
-    const msgs = messagesCache.get(chatJid) || [];
+    let msgs = messagesCache.get(chatJid) || [];
+    // Si no encontro por LID, intentar por JID mapeado o viceversa
+    if (msgs.length === 0) {
+      const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+      if (alt && messagesCache.has(alt)) msgs = messagesCache.get(alt);
+    }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ chat: chatJid, mensajes: msgs }));
   }
 
-  // Endpoint de Avatares One UI: entrega 42x42 RGB565 (3528 bytes) exactos
+  // Endpoint de Avatares Nativo One UI: entrega 42x42 RGB565 (3528 bytes) exactos
   if (pathname === "/api/avatar" && req.method === "GET") {
     const chatJid = parsedUrl.query.chat;
     if (!chatJid || !sock) {
@@ -359,8 +442,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // 2. Pedir URL del avatar a WhatsApp
-      const ppUrl = await sock.profilePictureUrl(chatJid, "image").catch(() => null);
+      // 2. Pedir URL del avatar a WhatsApp (intentar con JID original y mapeado)
+      let ppUrl = await sock.profilePictureUrl(chatJid, "image").catch(() => null);
+      if (!ppUrl) {
+        const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+        if (alt) ppUrl = await sock.profilePictureUrl(alt, "image").catch(() => null);
+      }
       if (!ppUrl) {
         res.writeHead(404); return res.end();
       }
@@ -380,67 +467,82 @@ const server = http.createServer(async (req, res) => {
           .raw()
           .toBuffer({ resolveWithObject: true }); // 42 * 42 * 3 (RGB888)
 
-        const raw565 = Buffer.alloc(42 * 42 * 2);
+        // Convertir RGB888 a RGB565 Little-Endian (formato directo para NavLz)
+        const rgb565Buf = Buffer.alloc(42 * 42 * 2);
         for (let i = 0; i < 42 * 42; i++) {
           const r = data[i * 3];
           const g = data[i * 3 + 1];
           const b = data[i * 3 + 2];
           const c565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-          raw565.writeUInt16LE(c565, i * 2);
+          rgb565Buf.writeUInt16LE(c565, i * 2);
         }
 
-        try { fs.writeFileSync(rawPath, raw565); } catch (e) {}
-
+        fs.writeFileSync(rawPath, rgb565Buf);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
-          "Content-Length": raw565.length,
+          "Content-Length": rgb565Buf.length,
           "Cache-Control": "public, max-age=604800"
         });
-        return res.end(raw565);
-      } else {
-        // Fallback temporal si Sharp no compilo aun
-        res.writeHead(200, {
-          "Content-Type": imgRes.headers.get("content-type") || "image/jpeg",
-          "Cache-Control": "public, max-age=86400"
-        });
-        return res.end(imgBuffer);
+        return res.end(rgb565Buf);
       }
-    } catch (err) {
-      res.writeHead(500); return res.end();
+
+      // Fallback si no hay sharp
+      res.writeHead(200, { "Content-Type": "image/jpeg" });
+      return res.end(imgBuffer);
+    } catch (e) {
+      console.log(`[Avatar] Error al procesar ${chatJid}:`, e.message);
+      res.writeHead(404);
+      return res.end();
     }
   }
 
+  // API Enviar mensaje
   if (pathname === "/api/enviar" && req.method === "POST") {
     let body = "";
-    req.on("data", chunk => { body += chunk.toString(); });
+    req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
         const { chat, texto } = JSON.parse(body);
-        await sock.sendMessage(chat, { text: texto });
+        if (!chat || !texto || !sock) {
+          res.writeHead(400); return res.end();
+        }
+
+        const sent = await sock.sendMessage(chat, { text: texto });
         const ts = Math.floor(Date.now() / 1000);
-        const timeStr = formatearHora(ts);
+        const timeStr = formatearHoraMensaje(ts);
+        const timeRel = formatearHora(ts);
+
         if (!messagesCache.has(chat)) messagesCache.set(chat, []);
-        messagesCache.get(chat).push({ id: String(ts), fromMe: true, deleted: false, text: texto, time: timeStr, ts });
+        messagesCache.get(chat).push({
+          id: sent.key.id,
+          fromMe: true,
+          sender: "T",
+          text: texto,
+          time: timeStr,
+          timestamp: ts
+        });
+
         if (chatsCache.has(chat)) {
           chatsCache.get(chat).lastMsg = texto;
-          chatsCache.get(chat).time = timeStr;
+          chatsCache.get(chat).time = timeRel;
           chatsCache.get(chat).timestamp = ts;
         }
+
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        return res.end(JSON.stringify({ ok: false, error: err.message }));
       }
     });
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "404" }));
+  res.writeHead(404);
+  res.end();
 });
 
 server.listen(PORT, () => {
-  console.log(`[EspCHAT Bridge v2.2] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.3] Activo en puerto ${PORT}`);
   startWhatsApp();
 });
