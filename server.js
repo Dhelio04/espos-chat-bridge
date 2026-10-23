@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.3.2 - Real Read Receipts, Strict Anti-Delete & Zero Double-Tap
+ * EspOS EspCHAT Cloud Bridge v2.4.0 - Live Presence, Real fromMe, On-Demand Sync & PTT Voice Notes
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -32,6 +32,7 @@ let messagesCache = new Map();
 let contactsMap = new Map(); // JID / LID -> Nombre de agenda
 let lidToJid = new Map();     // LID -> JID
 let jidToLid = new Map();     // JID -> LID
+let presenceMap = new Map();  // JID -> { status: "available"|"composing"|..., t: number }
 let callsList = [];
 
 function formatearHora(ts) {
@@ -202,6 +203,7 @@ function procesarMensaje(msg, esEnVivo = true) {
       time: timeRel,
       unread,
       timestamp: ts,
+      fromMe: fromMe,
       visto: fromMe ? false : true
     });
   } else if (prev && (!prev.name || prev.name.startsWith("Contacto WA") || prev.name.startsWith("+"))) {
@@ -333,6 +335,17 @@ async function startWhatsApp() {
 
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     for (const m of messages) procesarMensaje(m, true);
+  });
+
+  sock.ev.on("presence.update", ({ id, presences }) => {
+    if (!presences) return;
+    for (const [sender, p] of Object.entries(presences)) {
+      const j = id || sender;
+      const st = p.lastKnownPresence || (p.available ? "available" : "unavailable");
+      presenceMap.set(j, { status: st, t: Date.now() });
+      const alt = lidToJid.get(j) || jidToLid.get(j);
+      if (alt) presenceMap.set(alt, { status: st, t: Date.now() });
+    }
   });
 
   sock.ev.on("messages.update", (updates) => {
@@ -480,6 +493,12 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === "/api/mensajes" && req.method === "GET") {
     const chatJid = parsedUrl.query.chat;
+    if (sock && chatJid) {
+      sock.presenceSubscribe(chatJid).catch(() => {});
+      const altJid = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+      if (altJid) sock.presenceSubscribe(altJid).catch(() => {});
+    }
+
     let msgs = messagesCache.get(chatJid) || [];
     if (msgs.length === 0) {
       const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
@@ -501,23 +520,37 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    // Si aun esta vacio pero chatsCache conserva el ultimo mensaje real, sintetizarlo
+    // Si aun esta vacio pero chatsCache conserva el ultimo mensaje real, sintetizarlo CON SU fromMe REAL
     if (msgs.length === 0 && chatsCache.has(chatJid)) {
       const info = chatsCache.get(chatJid);
       if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
+        const fm = Boolean(info.fromMe);
         msgs = [{
           id: "preview_" + (info.timestamp || Date.now()),
-          fromMe: false,
-          sender: info.name || "Contacto",
+          fromMe: fm,
+          sender: fm ? (myName || "Tú") : (info.name || "Contacto"),
           text: info.lastMsg,
           time: info.time || "",
-          timestamp: info.timestamp || 0
+          timestamp: info.timestamp || 0,
+          read: true
         }];
       }
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
+
+    // Resolver presencia en tiempo real
+    let presStr = "";
+    const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+    const pInfo = presenceMap.get(chatJid) || (pAlt ? presenceMap.get(pAlt) : null);
+    if (pInfo) {
+      if (pInfo.status === "available") presStr = "En línea";
+      else if (pInfo.status === "composing") presStr = "Escribiendo...";
+      else if (pInfo.status === "recording") presStr = "Grabando audio...";
+      else if (Date.now() - pInfo.t < 60000) presStr = "En línea";
+    }
+
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ chat: chatJid, mensajes: msgs }));
+    return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, mensajes: msgs }));
   }
 
   // Endpoint de Avatares Nativo One UI: entrega 42x42 RGB565 (3528 bytes) exactos
@@ -617,20 +650,35 @@ const server = http.createServer(async (req, res) => {
         const timeStr = formatearHoraMensaje(ts);
         const timeRel = formatearHora(ts);
 
-        if (!messagesCache.has(chat)) messagesCache.set(chat, []);
-        messagesCache.get(chat).push({
+        const newMsgItem = {
           id: sent.key.id,
           fromMe: true,
-          sender: "T",
+          sender: myName || "Tú",
           text: texto,
           time: timeStr,
-          timestamp: ts
-        });
+          timestamp: ts,
+          status: 2,
+          read: false
+        };
+
+        if (!messagesCache.has(chat)) messagesCache.set(chat, []);
+        messagesCache.get(chat).push(newMsgItem);
+        if (messagesCache.get(chat).length > 50) messagesCache.get(chat).shift();
+
+        const alt = lidToJid.get(chat) || jidToLid.get(chat);
+        if (alt) {
+          if (!messagesCache.has(alt)) messagesCache.set(alt, []);
+          messagesCache.get(alt).push(newMsgItem);
+          if (messagesCache.get(alt).length > 50) messagesCache.get(alt).shift();
+        }
 
         if (chatsCache.has(chat)) {
-          chatsCache.get(chat).lastMsg = texto;
-          chatsCache.get(chat).time = timeRel;
-          chatsCache.get(chat).timestamp = ts;
+          const c = chatsCache.get(chat);
+          c.lastMsg = texto;
+          c.time = timeRel;
+          c.timestamp = ts;
+          c.fromMe = true;
+          c.unread = 0;
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -638,6 +686,68 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // API Enviar Nota de Voz oficial (PTT)
+  if (pathname === "/api/enviar_audio" && req.method === "POST") {
+    const chat = parsedUrl.query.chat;
+    if (!chat || !sock) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
+    }
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", async () => {
+      try {
+        const audioBuf = Buffer.concat(chunks);
+        if (audioBuf.length < 100) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Audio vacio o corrupto" }));
+        }
+
+        // Enviar con ptt: true para que WhatsApp lo marque como nota de voz oficial
+        const sent = await sock.sendMessage(chat, {
+          audio: audioBuf,
+          mimetype: "audio/mp4",
+          ptt: true
+        });
+
+        const ts = Math.floor(Date.now() / 1000);
+        const timeStr = formatearHoraMensaje(ts);
+        const timeRel = formatearHora(ts);
+
+        const newMsgItem = {
+          id: sent.key.id,
+          fromMe: true,
+          sender: myName || "Tú",
+          text: "[Nota de voz]",
+          time: timeStr,
+          timestamp: ts,
+          status: 2,
+          read: false
+        };
+
+        if (!messagesCache.has(chat)) messagesCache.set(chat, []);
+        messagesCache.get(chat).push(newMsgItem);
+
+        if (chatsCache.has(chat)) {
+          const c = chatsCache.get(chat);
+          c.lastMsg = "[Nota de voz]";
+          c.time = timeRel;
+          c.timestamp = ts;
+          c.fromMe = true;
+          c.unread = 0;
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+      } catch (e) {
+        console.error("[Audio] Error:", e);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: e.message }));
       }
     });
     return;
