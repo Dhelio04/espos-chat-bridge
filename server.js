@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.3 - Send 24 Most Recent Messages & Precision Sync ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.5.4 - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -575,6 +575,25 @@ const server = http.createServer(async (req, res) => {
 
   // API Chats (Unificado, desduplicado total y clasificado)
   if (pathname === "/api/chats" && req.method === "GET") {
+    // Sincronizar chatsCache con el mensaje más reciente de messagesCache antes de ordenar
+    for (const [jid, mList] of messagesCache.entries()) {
+      if (Array.isArray(mList) && mList.length > 0) {
+        const ult = mList[mList.length - 1];
+        if (ult && ult.timestamp) {
+          const c = chatsCache.get(jid) || { id: jid };
+          if (ult.timestamp > (c.timestamp || 0)) {
+            c.timestamp = ult.timestamp;
+            c.time = ult.time || c.time;
+            if (ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
+              c.lastMsg = ult.text;
+            }
+            c.fromMe = Boolean(ult.fromMe);
+            chatsCache.set(jid, c);
+          }
+        }
+      }
+    }
+
     const vistanombres = new Set();
     const sorted = Array.from(chatsCache.values())
       .filter(c => c && c.id)
@@ -611,6 +630,21 @@ const server = http.createServer(async (req, res) => {
       if (c.lastMsg && (c.lastMsg.includes("Toca para abrir") || c.lastMsg.includes("Conversaci"))) {
         c.lastMsg = "";
       }
+
+      // Si lastMsg sigue vacio, buscar el ultimo mensaje en messagesCache
+      if (!c.lastMsg || c.lastMsg === "") {
+        const mList = messagesCache.get(c.id) || (alt ? messagesCache.get(alt) : null);
+        if (mList && mList.length > 0) {
+          const ult = mList[mList.length - 1];
+          if (ult && ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
+            c.lastMsg = ult.text;
+            c.time = ult.time || c.time;
+            c.timestamp = ult.timestamp || c.timestamp;
+            c.fromMe = Boolean(ult.fromMe);
+          }
+        }
+      }
+
       const peer = lidToJid.get(c.id) || jidToLid.get(c.id) || c.id;
       if (vistanombres.has(peer) || vistanombres.has(c.id)) continue;
 
