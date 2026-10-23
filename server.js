@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.0 - Real Group Names, Persistent Store, Precision Presence & Strict LID/JID Mapping
+ * EspOS EspCHAT Cloud Bridge v2.5.1 - Real WhatsApp Activity Presence ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -66,6 +66,29 @@ function cargarStoreDisco() {
 cargarStoreDisco();
 
 let guardarTimer = null;
+
+function formatearUltimaVez(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    const ahora = new Date();
+    const esHoy = d.getDate() === ahora.getDate() && d.getMonth() === ahora.getMonth() && d.getFullYear() === ahora.getFullYear();
+    const pad = (n) => String(n).padStart(2, "0");
+    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (esHoy) {
+      return `últ. vez hoy a las ${hhmm}`;
+    }
+    const ayer = new Date(ahora.getTime() - 24 * 60 * 60 * 1000);
+    const esAyer = d.getDate() === ayer.getDate() && d.getMonth() === ayer.getMonth() && d.getFullYear() === ayer.getFullYear();
+    if (esAyer) {
+      return `últ. vez ayer a las ${hhmm}`;
+    }
+    return `últ. vez ${pad(d.getDate())}/${pad(d.getMonth() + 1)} a las ${hhmm}`;
+  } catch (e) {
+    return "";
+  }
+}
+
 function programarGuardadoDisco() {
   if (guardarTimer) clearTimeout(guardarTimer);
   guardarTimer = setTimeout(() => {
@@ -244,6 +267,15 @@ function procesarMensaje(msg, esEnVivo = true) {
   if (!msg || !msg.message) return;
   const jid = msg.key?.remoteJid;
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
+
+  if (!fromMe && jid && !jid.endsWith("@g.us")) {
+    const mts = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+    const curP = presenceMap.get(jid) || {};
+    curP.lastSeen = mts;
+    presenceMap.set(jid, curP);
+    const altJ = lidToJid.get(jid) || jidToLid.get(jid);
+    if (altJ) presenceMap.set(altJ, curP);
+  }
 
   // Escudo Anti-Delete: detectar revocacion SOLO si el tipo es REVOKE (type 0)
   const raw = msg.message;
@@ -443,15 +475,22 @@ async function startWhatsApp() {
     for (const [sender, p] of Object.entries(presences)) {
       const j = id || sender;
       const st = p.lastKnownPresence;
+      const cur = presenceMap.get(j) || {};
+      cur.status = st;
       if (st === "available" || st === "composing" || st === "recording") {
-        presenceMap.set(j, { status: st, t: Date.now() });
-        const alt = lidToJid.get(j) || jidToLid.get(j);
-        if (alt) presenceMap.set(alt, { status: st, t: Date.now() });
+        cur.t = Date.now();
       } else if (st === "unavailable") {
-        presenceMap.set(j, { status: "unavailable", t: 0 });
-        const alt = lidToJid.get(j) || jidToLid.get(j);
-        if (alt) presenceMap.set(alt, { status: "unavailable", t: 0 });
+        cur.t = 0;
+        if (p.lastSeen) {
+          const ls = Number(p.lastSeen);
+          cur.lastSeen = ls < 2000000000 ? ls * 1000 : ls;
+        } else {
+          cur.lastSeen = Date.now();
+        }
       }
+      presenceMap.set(j, cur);
+      const alt = lidToJid.get(j) || jidToLid.get(j);
+      if (alt) presenceMap.set(alt, cur);
     }
   });
 
@@ -653,17 +692,21 @@ const server = http.createServer(async (req, res) => {
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
 
-    // Resolver presencia en tiempo real con precision One UI (cero falsos 'en linea')
+    // Resolver presencia en tiempo real con precisión One UI (cero falsos 'en linea')
     let presStr = "";
-    const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
-    const pInfo = presenceMap.get(chatJid) || (pAlt ? presenceMap.get(pAlt) : null);
-    if (pInfo && pInfo.status) {
-      if (pInfo.status === "composing") {
-        presStr = "Escribiendo...";
-      } else if (pInfo.status === "recording") {
-        presStr = "Grabando audio...";
-      } else if (pInfo.status === "available" && pInfo.t > 0 && (Date.now() - pInfo.t < 35000)) {
-        presStr = "En línea";
+    if (!chatJid.endsWith("@g.us") && !chatJid.endsWith("@newsletter")) {
+      const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+      const pInfo = presenceMap.get(chatJid) || (pAlt ? presenceMap.get(pAlt) : null);
+      if (pInfo) {
+        if (pInfo.status === "composing") {
+          presStr = "Escribiendo...";
+        } else if (pInfo.status === "recording") {
+          presStr = "Grabando audio...";
+        } else if (pInfo.status === "available" && pInfo.t > 0 && (Date.now() - pInfo.t < 35000)) {
+          presStr = "En línea";
+        } else if (pInfo.lastSeen) {
+          presStr = formatearUltimaVez(pInfo.lastSeen);
+        }
       }
     }
 
