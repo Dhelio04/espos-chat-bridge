@@ -806,20 +806,31 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    // Si aun esta vacio pero chatsCache conserva el ultimo mensaje real, sintetizarlo CON SU fromMe REAL
-    if (msgs.length === 0 && chatsCache.has(chatJid)) {
+    // Incorporar el mensaje mas reciente de chatsCache si messagesCache esta vacio o desfasado
+    if (chatsCache.has(chatJid)) {
       const info = chatsCache.get(chatJid);
       if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
-        const fm = Boolean(info.fromMe);
-        msgs = [{
-          id: "preview_" + (info.timestamp || Date.now()),
-          fromMe: fm,
-          sender: fm ? (myName || "Tú") : (info.name || "Contacto"),
-          text: info.lastMsg,
-          time: info.time || "",
-          timestamp: info.timestamp || 0,
-          read: true
-        }];
+        const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
+        const infoTs = Number(info.timestamp || 0);
+
+        // Si el historial existente esta desfasado por mas de 7 dias respecto al mensaje actual del chat, purgarlo
+        if (msgs.length > 0 && infoTs > 0 && (infoTs - lastMsgTs > 7 * 86400)) {
+          msgs = [];
+        }
+
+        // Si no hay mensajes o el mensaje del chat es mas nuevo que el ultimo del historial:
+        if (msgs.length === 0 || infoTs > lastMsgTs) {
+          const fm = Boolean(info.fromMe);
+          msgs.push({
+            id: "latest_" + (infoTs || Date.now()),
+            fromMe: fm,
+            sender: fm ? (myName || "Tú") : (info.name || "Contacto"),
+            text: info.lastMsg,
+            time: info.time || "",
+            timestamp: infoTs || Math.floor(Date.now() / 1000),
+            read: true
+          });
+        }
       }
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
@@ -966,6 +977,7 @@ const server = http.createServer(async (req, res) => {
 
       const rgbBuf = await sharp(mediaBuf, { page: 0 })
         .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
+        .removeAlpha()
         .raw()
         .toBuffer();
 
@@ -1165,7 +1177,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.7.1] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.7.2] Activo en puerto ${PORT}`);
   startWhatsApp();
 
   // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
