@@ -36,9 +36,11 @@ let myName = "";
 let currentQR = "";
 let chatsCache = new Map();
 let messagesCache = new Map();
-let contactsMap = new Map(); // JID / LID -> Nombre de agenda
-let lidToJid = new Map();     // LID -> JID
-let jidToLid = new Map();     // JID -> LID
+let agendaMap = new Map();   // JID / LID -> Nombre guardado por el usuario en su agenda (Google Contacts)
+let pushNameMap = new Map(); // JID / LID -> Apodo que el contacto se puso a si mismo
+let contactsMap = agendaMap; // Alias de compatibilidad
+let lidToJid = new Map();    // LID -> JID
+let jidToLid = new Map();    // JID -> LID
 let presenceMap = new Map();  // JID -> { status: "available"|"composing"|..., t: number }
 let callsList = [];
 
@@ -49,8 +51,14 @@ function cargarStoreDisco() {
   try {
     if (fs.existsSync(storeFile)) {
       const data = JSON.parse(fs.readFileSync(storeFile, "utf-8"));
-      if (data.contacts) {
-        for (const [k, v] of Object.entries(data.contacts)) contactsMap.set(k, v);
+      if (data.agenda) {
+        for (const [k, v] of Object.entries(data.agenda)) agendaMap.set(k, v);
+      }
+      if (data.pushNames) {
+        for (const [k, v] of Object.entries(data.pushNames)) pushNameMap.set(k, v);
+      }
+      if (data.contacts && agendaMap.size === 0) {
+        for (const [k, v] of Object.entries(data.contacts)) agendaMap.set(k, v);
       }
       if (data.lidToJid) {
         for (const [k, v] of Object.entries(data.lidToJid)) lidToJid.set(k, v);
@@ -103,7 +111,9 @@ function programarGuardadoDisco() {
   guardarTimer = setTimeout(() => {
     try {
       const payload = {
-        contacts: Object.fromEntries(contactsMap.entries()),
+        agenda: Object.fromEntries(agendaMap.entries()),
+        pushNames: Object.fromEntries(pushNameMap.entries()),
+        contacts: Object.fromEntries(agendaMap.entries()),
         lidToJid: Object.fromEntries(lidToJid.entries()),
         jidToLid: Object.fromEntries(jidToLid.entries()),
         chats: Object.fromEntries(chatsCache.entries()),
@@ -232,35 +242,15 @@ function resolverNombre(jid, pushName, fromMe) {
   if (!jid) return "Contacto";
   if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
   
-  // 1. Agenda telefónica o LID mapeado
   const alt = lidToJid.get(jid) || jidToLid.get(jid);
-  const guardado = contactsMap.get(jid) || (alt ? contactsMap.get(alt) : null);
-  if (guardado && guardado !== myName && !guardado.startsWith("Contacto WA") && !guardado.startsWith("Comunidad #") && !guardado.startsWith("+")) {
-    return guardado;
+
+  // 1. PRIORIDAD MAXIMA: Agenda del usuario (lo que Gabriel guardo en su telefono)
+  const nomAgenda = agendaMap.get(jid) || (alt ? agendaMap.get(alt) : null);
+  if (nomAgenda && nomAgenda !== myName && !nomAgenda.startsWith("Contacto WA") && !nomAgenda.startsWith("Comunidad #") && !nomAgenda.startsWith("+")) {
+    return nomAgenda;
   }
 
-  // 2. Nombre de perfil asignado por el emisor (pushName)
-  if (!fromMe && pushName && pushName !== myName) {
-    contactsMap.set(jid, pushName);
-    if (alt) contactsMap.set(alt, pushName);
-    programarGuardadoDisco();
-    return pushName;
-  }
-
-  // 2.5 Buscar si en el historial de mensajes el emisor dejo su pushName o nombre real
-  const histMsgs = messagesCache.get(jid) || (alt ? messagesCache.get(alt) : null);
-  if (Array.isArray(histMsgs)) {
-    for (const m of histMsgs) {
-      if (!m.fromMe && m.sender && m.sender !== "Contacto" && m.sender !== myName && !m.sender.startsWith("Contacto WA") && !m.sender.startsWith("+")) {
-        contactsMap.set(jid, m.sender);
-        if (alt) contactsMap.set(alt, m.sender);
-        programarGuardadoDisco();
-        return m.sender;
-      }
-    }
-  }
-
-  // 3. Preservar nombre previo en chatsCache si ya era un nombre real
+  // 2. Si chatsCache ya tiene un nombre guardado de agenda, conservarlo intacto
   if (chatsCache.has(jid)) {
     const cName = chatsCache.get(jid).name;
     if (cName && !cName.startsWith("Contacto WA") && !cName.startsWith("Comunidad #") && !cName.startsWith("+")) {
@@ -274,7 +264,27 @@ function resolverNombre(jid, pushName, fromMe) {
     }
   }
 
-  // 4. Fallback legible
+  // 3. PRIORIDAD SECUNDARIA: Apodo asignado por el emisor (pushName)
+  const nomPush = (!fromMe && pushName && pushName !== myName) ? pushName : (pushNameMap.get(jid) || (alt ? pushNameMap.get(alt) : null));
+  if (nomPush && nomPush !== myName) {
+    pushNameMap.set(jid, nomPush);
+    if (alt) pushNameMap.set(alt, nomPush);
+    return nomPush;
+  }
+
+  // 4. Buscar si en el historial de mensajes el emisor dejo su pushName
+  const histMsgs = messagesCache.get(jid) || (alt ? messagesCache.get(alt) : null);
+  if (Array.isArray(histMsgs)) {
+    for (const m of histMsgs) {
+      if (!m.fromMe && m.sender && m.sender !== "Contacto" && m.sender !== myName && !m.sender.startsWith("Contacto WA") && !m.sender.startsWith("+")) {
+        pushNameMap.set(jid, m.sender);
+        if (alt) pushNameMap.set(alt, m.sender);
+        return m.sender;
+      }
+    }
+  }
+
+  // 5. Fallback legible
   const base = jid.split("@")[0];
   if (jid.endsWith("@g.us")) return "Comunidad #" + base.slice(0, 6);
   if (jid.endsWith("@lid") || base.length > 12) return "Contacto WA  " + base.slice(-4);
@@ -283,16 +293,23 @@ function resolverNombre(jid, pushName, fromMe) {
 
 function guardarContacto(c) {
   if (!c) return;
-  const nom = c.name || c.notify || c.verifiedName;
   if (c.id && c.lid) {
     lidToJid.set(c.lid, c.id);
     jidToLid.set(c.id, c.lid);
   }
-  if (nom && nom !== myName) {
-    if (c.id) contactsMap.set(c.id, nom);
-    if (c.lid) contactsMap.set(c.lid, nom);
-    if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
-    if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
+  // c.name es el nombre real guardado en el telefono del usuario
+  if (c.name && c.name !== myName) {
+    if (c.id) agendaMap.set(c.id, c.name);
+    if (c.lid) agendaMap.set(c.lid, c.name);
+    if (chatsCache.has(c.id)) chatsCache.get(c.id).name = c.name;
+    if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = c.name;
+    programarGuardadoDisco();
+  }
+  // c.notify / pushName es el apodo del contacto
+  const apodo = c.notify || c.verifiedName;
+  if (apodo && apodo !== myName) {
+    if (c.id) pushNameMap.set(c.id, apodo);
+    if (c.lid) pushNameMap.set(c.lid, apodo);
     programarGuardadoDisco();
   }
 }
@@ -625,9 +642,9 @@ const server = http.createServer(async (req, res) => {
     const cJid = parsedUrl.query.chat;
     const cNom = parsedUrl.query.nombre;
     if (cJid && cNom) {
-      contactsMap.set(cJid, cNom.trim());
+      agendaMap.set(cJid, cNom.trim());
       const altJid = lidToJid.get(cJid) || jidToLid.get(cJid);
-      if (altJid) contactsMap.set(altJid, cNom.trim());
+      if (altJid) agendaMap.set(altJid, cNom.trim());
       if (chatsCache.has(cJid)) chatsCache.get(cJid).name = cNom.trim();
       if (altJid && chatsCache.has(altJid)) chatsCache.get(altJid).name = cNom.trim();
       programarGuardadoDisco();
