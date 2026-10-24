@@ -1101,7 +1101,13 @@ const server = http.createServer(async (req, res) => {
   res.end();
 });
 
-server.listen(PORT, () => {
-  console.log(`[EspCHAT Bridge v2.3] Activo en puerto ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[EspCHAT Bridge v2.5.5] Activo en puerto ${PORT}`);
   startWhatsApp();
 });
+if (String(PORT) !== "3000") {
+  try {
+    const s3000 = http.createServer(server.listeners("request")[0]);
+    s3000.listen(3000, "0.0.0.0");
+  } catch (e) {}
+}
