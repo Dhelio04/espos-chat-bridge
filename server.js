@@ -328,15 +328,7 @@ function procesarMensaje(msg, esEnVivo = true) {
 
   const fromMe = Boolean(msg.key?.fromMe);
   const rawTs = msg.messageTimestamp;
-  // Presencia: registrar timestamp del ultimo mensaje recibido para "ult. vez..."
-  if (!fromMe && !jid.endsWith("@g.us") && !jid.endsWith("@newsletter")) {
-    const msgTs = rawTs ? (typeof rawTs === "number" ? rawTs * 1000 : Number(rawTs.low || rawTs) * 1000) : Date.now();
-    const curP = presenceMap.get(jid) || {};
-    curP.lastSeen = msgTs;
-    presenceMap.set(jid, curP);
-    const altJid = lidToJid.get(jid) || jidToLid.get(jid);
-    if (altJid) presenceMap.set(altJid, Object.assign({}, curP));
-  }
+  // Presencia: solo eventos reales de WhatsApp presencia
   const ts = rawTs ? (typeof rawTs === "number" ? rawTs : Number(rawTs.low || rawTs)) : Math.floor(Date.now() / 1000);
   const timeStr = formatearHoraMensaje(ts);
   const timeRel = formatearHora(ts);
@@ -526,7 +518,7 @@ async function startWhatsApp() {
           const ls = Number(p.lastSeen);
           cur.lastSeen = ls < 2000000000 ? ls * 1000 : ls;
         } else {
-          cur.lastSeen = Date.now();
+          cur.lastSeen = null;
         }
       }
       presenceMap.set(j, cur);
@@ -767,12 +759,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
 
-    // Entregar siempre los 24 mensajes más recientes (los últimos en orden cronológico)
+    // Deduplicar mensajes por id y ordenar estrictamente de mas antiguo a mas reciente
+    const mapMsg = new Map();
+    for (const m of msgs) {
+      if (m && m.id) mapMsg.set(m.id, m);
+    }
+    msgs = Array.from(mapMsg.values()).sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
     if (msgs.length > 30) {
       msgs = msgs.slice(-30);
     }
 
-    // Resolver presencia en tiempo real con precision One UI (cero falsos 'en linea')
+    // Resolver presencia en tiempo real con precision oficial (cero falsos 'en linea' ni horas inventadas)
     let presStr = "";
     if (!chatJid.endsWith("@g.us") && !chatJid.endsWith("@newsletter")) {
       const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
@@ -788,17 +785,7 @@ const server = http.createServer(async (req, res) => {
           presStr = formatearUltimaVez(pInfo.lastSeen);
         }
       }
-      // Si no hay presencia activa, buscar la fecha del ultimo mensaje recibido de este contacto
-      if (!presStr) {
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (!msgs[i].fromMe && msgs[i].timestamp) {
-            presStr = formatearUltimaVez(msgs[i].timestamp * 1000);
-            break;
-          }
-        }
-      }
     }
-
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, mensajes: msgs }));
   }
