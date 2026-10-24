@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.8.0 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.8.1 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -70,12 +70,16 @@ function cargarStoreDisco() {
         for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
       }
       if (data.messages) {
-        const nowSec = Math.floor(Date.now() / 1000);
         for (const [k, v] of Object.entries(data.messages)) {
           if (Array.isArray(v)) {
-            const recientes = v.filter(m => (nowSec - (Number(m.timestamp) || 0)) < 86400).slice(-30);
+            const recientes = v.slice(-30);
             if (recientes.length > 0) messagesCache.set(k, recientes);
           }
+        }
+      }
+      if (data.rawMedia) {
+        for (const [k, v] of Object.entries(data.rawMedia)) {
+          rawMediaMap.set(k, v);
         }
       }
       console.log(`[Store] Restaurado desde disco: ${chatsCache.size} chats, ${messagesCache.size} historiales, ${contactsMap.size} contactos.`);
@@ -123,7 +127,8 @@ function programarGuardadoDisco() {
         lidToJid: Object.fromEntries(lidToJid.entries()),
         jidToLid: Object.fromEntries(jidToLid.entries()),
         chats: Object.fromEntries(chatsCache.entries()),
-        messages: Object.fromEntries(messagesCache.entries())
+        messages: Object.fromEntries(messagesCache.entries()),
+        rawMedia: Object.fromEntries(Array.from(rawMediaMap.entries()).slice(-100))
       };
       fs.writeFileSync(storeFile, JSON.stringify(payload));
     } catch (e) {
@@ -345,6 +350,35 @@ function procesarMensaje(msg, esEnVivo = true) {
       const k = rawMediaMap.keys().next().value;
       rawMediaMap.delete(k);
     }
+    // Precarga asincrona inmediata de stickers a formato RGB565 One UI
+    if (innerMsg?.stickerMessage && sharp) {
+      const sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const rPath = path.join(stickersFolder, `${sId}.raw`);
+      if (!fs.existsSync(rPath)) {
+        downloadMediaMessage(msg, "buffer", {}, {
+          logger: pino({ level: "silent" }),
+          reuploadRequest: sock?.updateMediaMessage
+        }).then(buf => {
+          if (buf) {
+            return sharp(buf, { page: 0 })
+              .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
+              .removeAlpha()
+              .raw()
+              .toBuffer();
+          }
+        }).then(rgbBuf => {
+          if (rgbBuf && rgbBuf.length === 64 * 64 * 3) {
+            const rgb565 = Buffer.alloc(64 * 64 * 2);
+            for (let i = 0; i < 64 * 64; i++) {
+              const r = rgbBuf[i * 3], g = rgbBuf[i * 3 + 1], b = rgbBuf[i * 3 + 2];
+              const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+              rgb565.writeUInt16LE(c16, i * 2);
+            }
+            fs.writeFileSync(rPath, rgb565);
+          }
+        }).catch(() => {});
+      }
+    }
   }
 
   // Escudo Anti-Delete: detectar revocacion SOLO si el tipo es REVOKE (type 0)
@@ -438,7 +472,17 @@ async function startWhatsApp() {
       auth: state,
       browser: ["EspOS microPC", "Chrome", "20.0.04"],
       syncFullHistory: true,
-      markOnlineOnConnect: true
+      shouldSyncHistoryMessage: () => true,
+      markOnlineOnConnect: true,
+      getMessage: async (key) => {
+        if (!key?.remoteJid) return undefined;
+        const list = messagesCache.get(key.remoteJid);
+        if (list) {
+          const m = list.find(x => x.id === key.id);
+          if (m) return { conversation: m.text };
+        }
+        return undefined;
+      }
     });
 
   sock.ev.on("creds.update", saveCreds);
@@ -836,16 +880,8 @@ const server = http.createServer(async (req, res) => {
         const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
         const infoTs = Number(info.timestamp || 0);
 
-        // Si el historial existente tiene desfase > 24 horas respecto al chat activo, purgar obsoletos
-        if (msgs.length > 0 && infoTs > 0 && (infoTs - lastMsgTs > 86400)) {
-          msgs = [];
-          messagesCache.set(chatJid, []);
-          const altJ = lidToJid.get(chatJid) || jidToLid.get(chatJid);
-          if (altJ) messagesCache.set(altJ, []);
-        }
-
-        // Si no hay mensajes o el mensaje del chat es mas nuevo que el ultimo del historial:
-        if (msgs.length === 0 || infoTs > lastMsgTs) {
+        // Incorporar el mensaje mas reciente si la lista esta vacia o infoTs es mas nuevo
+        if (msgs.length === 0 || (infoTs > 0 && infoTs > lastMsgTs)) {
           const fm = Boolean(info.fromMe);
           msgs.push({
             id: "latest_" + (infoTs || Date.now()),
