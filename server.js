@@ -290,9 +290,15 @@ function procesarMensaje(msg, esEnVivo = true) {
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
 
   // Registrar en rawMediaMap si tiene sticker o audio para descarga bajo demanda
-  if (msg.key?.id && (msg.message.stickerMessage || msg.message.audioMessage || msg.message.imageMessage)) {
+  let innerMsg = msg.message;
+  if (innerMsg?.ephemeralMessage?.message) innerMsg = innerMsg.ephemeralMessage.message;
+  if (innerMsg?.viewOnceMessage?.message) innerMsg = innerMsg.viewOnceMessage.message;
+  if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
+  if (innerMsg?.documentWithCaptionMessage?.message) innerMsg = innerMsg.documentWithCaptionMessage.message;
+
+  if (msg.key?.id && (innerMsg?.stickerMessage || innerMsg?.audioMessage || innerMsg?.imageMessage)) {
     rawMediaMap.set(msg.key.id, msg);
-    if (rawMediaMap.size > 200) {
+    if (rawMediaMap.size > 300) {
       const k = rawMediaMap.keys().next().value;
       rawMediaMap.delete(k);
     }
@@ -339,13 +345,18 @@ function procesarMensaje(msg, esEnVivo = true) {
   const lista = messagesCache.get(jid);
   const mStatus = msg.status || (fromMe ? 2 : 0);
   const isRead = Boolean(mStatus === 4 || mStatus === 5);
+    let durSec = 0;
+  if (innerMsg?.audioMessage?.seconds) {
+    durSec = Math.round(Number(innerMsg.audioMessage.seconds));
+  }
   lista.push({
     id: msg.key.id,
     fromMe,
-    sender: msg.pushName || (fromMe ? "T" : "Contacto"),
+    sender: msg.pushName || (fromMe ? "T\u00fa" : "Contacto"),
     text,
     time: timeStr,
     timestamp: ts,
+    duration: durSec,
     status: mStatus,
     read: isRead
   });
@@ -757,8 +768,8 @@ const server = http.createServer(async (req, res) => {
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
 
     // Entregar siempre los 24 mensajes más recientes (los últimos en orden cronológico)
-    if (msgs.length > 24) {
-      msgs = msgs.slice(-24);
+    if (msgs.length > 30) {
+      msgs = msgs.slice(-30);
     }
 
     // Resolver presencia en tiempo real con precision One UI (cero falsos 'en linea')
@@ -901,7 +912,7 @@ const server = http.createServer(async (req, res) => {
       });
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
 
-      const rgbBuf = await sharp(mediaBuf)
+      const rgbBuf = await sharp(mediaBuf, { page: 0 })
         .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
         .raw()
         .toBuffer();
