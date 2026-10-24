@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.5.5 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.8.0 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -70,7 +70,13 @@ function cargarStoreDisco() {
         for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
       }
       if (data.messages) {
-        for (const [k, v] of Object.entries(data.messages)) messagesCache.set(k, v);
+        const nowSec = Math.floor(Date.now() / 1000);
+        for (const [k, v] of Object.entries(data.messages)) {
+          if (Array.isArray(v)) {
+            const recientes = v.filter(m => (nowSec - (Number(m.timestamp) || 0)) < 86400).slice(-30);
+            if (recientes.length > 0) messagesCache.set(k, recientes);
+          }
+        }
       }
       console.log(`[Store] Restaurado desde disco: ${chatsCache.size} chats, ${messagesCache.size} historiales, ${contactsMap.size} contactos.`);
     }
@@ -389,7 +395,7 @@ function procesarMensaje(msg, esEnVivo = true) {
     status: mStatus,
     read: isRead
   });
-  if (lista.length > 50) lista.shift();
+  if (lista.length > 30) lista.shift();
 
   // Actualizar chatsCache
   const name = resolverNombre(jid, msg.pushName, fromMe);
@@ -672,6 +678,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   // API Chats (Unificado, desduplicado total y clasificado)
+  
+  // Endpoint para vaciar cache de mensajes obsoletos y stickers (Regla de frescura)
+  if ((pathname === "/api/limpiar" || pathname === "/api/vaciar_cache") && req.method === "GET") {
+    messagesCache.clear();
+    try {
+      if (fs.existsSync(stickersFolder)) {
+        const files = fs.readdirSync(stickersFolder);
+        for (const f of files) {
+          try { fs.unlinkSync(path.join(stickersFolder, f)); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    guardarStoreDisco();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, mensaje: "Cache de mensajes y stickers vaciado con exito (solo 30 ultimos activos)" }));
+  }
+
   if (pathname === "/api/chats" && req.method === "GET") {
     // Sincronizar chatsCache con el mensaje mas reciente de messagesCache antes de ordenar
     for (const [jid, mList] of messagesCache.entries()) {
@@ -813,9 +836,12 @@ const server = http.createServer(async (req, res) => {
         const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
         const infoTs = Number(info.timestamp || 0);
 
-        // Si el historial existente esta desfasado por mas de 7 dias respecto al mensaje actual del chat, purgarlo
-        if (msgs.length > 0 && infoTs > 0 && (infoTs - lastMsgTs > 7 * 86400)) {
+        // Si el historial existente tiene desfase > 24 horas respecto al chat activo, purgar obsoletos
+        if (msgs.length > 0 && infoTs > 0 && (infoTs - lastMsgTs > 86400)) {
           msgs = [];
+          messagesCache.set(chatJid, []);
+          const altJ = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+          if (altJ) messagesCache.set(altJ, []);
         }
 
         // Si no hay mensajes o el mensaje del chat es mas nuevo que el ultimo del historial:
@@ -1177,7 +1203,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.7.2] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.8.0] Activo en puerto ${PORT}`);
   startWhatsApp();
 
   // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
