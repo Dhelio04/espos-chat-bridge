@@ -1,5 +1,5 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.8.1 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
+ * EspOS EspCHAT Cloud Bridge v2.8.2 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
  * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
  * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
  * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
@@ -26,6 +26,19 @@ const audioFolder = path.join(__dirname, "audio_cache");
 if (!fs.existsSync(avatarsFolder)) fs.mkdirSync(avatarsFolder, { recursive: true });
 if (!fs.existsSync(stickersFolder)) fs.mkdirSync(stickersFolder, { recursive: true });
 if (!fs.existsSync(audioFolder)) fs.mkdirSync(audioFolder, { recursive: true });
+
+// Purgar cache de stickers antiguos generados con stride incorrecto (v2.8.2)
+try {
+  if (fs.existsSync(stickersFolder)) {
+    const sFiles = fs.readdirSync(stickersFolder);
+    for (const f of sFiles) {
+      try { fs.unlinkSync(path.join(stickersFolder, f)); } catch (_) {}
+    }
+    console.log(`[Stickers] Cache purgado al iniciar (${sFiles.length} stickers limpiados)`);
+  }
+} catch (e) {
+  console.warn('[Stickers] Error purgando cache:', e.message);
+}
 
 const rawMediaMap = new Map(); // msgId -> WAMessage
 
@@ -362,15 +375,19 @@ function procesarMensaje(msg, esEnVivo = true) {
           if (buf) {
             return sharp(buf, { page: 0 })
               .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
-              .removeAlpha()
+              .flatten({ background: { r: 19, g: 27, b: 36 } })
               .raw()
-              .toBuffer();
+              .toBuffer({ resolveWithObject: true });
           }
-        }).then(rgbBuf => {
-          if (rgbBuf && rgbBuf.length === 64 * 64 * 3) {
+        }).then(resObj => {
+          if (resObj && resObj.data) {
+            const data = resObj.data;
+            const channels = resObj.info.channels || 3;
             const rgb565 = Buffer.alloc(64 * 64 * 2);
             for (let i = 0; i < 64 * 64; i++) {
-              const r = rgbBuf[i * 3], g = rgbBuf[i * 3 + 1], b = rgbBuf[i * 3 + 2];
+              const r = data[i * channels];
+              const g = data[i * channels + 1];
+              const b = data[i * channels + 2];
               const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
               rgb565.writeUInt16LE(c16, i * 2);
             }
@@ -1037,17 +1054,19 @@ const server = http.createServer(async (req, res) => {
       });
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
 
-      const rgbBuf = await sharp(mediaBuf, { page: 0 })
+      const resObj = await sharp(mediaBuf, { page: 0 })
         .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
-        .removeAlpha()
+        .flatten({ background: { r: 19, g: 27, b: 36 } })
         .raw()
-        .toBuffer();
+        .toBuffer({ resolveWithObject: true });
 
+      const data = resObj.data;
+      const channels = resObj.info.channels || 3;
       const rgb565 = Buffer.alloc(64 * 64 * 2);
       for (let i = 0; i < 64 * 64; i++) {
-        const r = rgbBuf[i * 3];
-        const g = rgbBuf[i * 3 + 1];
-        const b = rgbBuf[i * 3 + 2];
+        const r = data[i * channels];
+        const g = data[i * channels + 1];
+        const b = data[i * channels + 2];
         const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
         rgb565.writeUInt16LE(c16, i * 2);
       }
@@ -1189,12 +1208,50 @@ const server = http.createServer(async (req, res) => {
           return res.end(JSON.stringify({ error: "Audio vacio o corrupto" }));
         }
 
-        // Enviar con ptt: true para que WhatsApp lo marque como nota de voz oficial
+        // Transcodificar WAV (16kHz PCM) a Ogg Opus para WhatsApp PTT
+        const tmpId = Date.now() + "_" + Math.floor(Math.random() * 10000);
+        const inWav = path.join(audioFolder, `in_${tmpId}.wav`);
+        const outOgg = path.join(audioFolder, `out_${tmpId}.ogg`);
+        fs.writeFileSync(inWav, audioBuf);
+
+        const transcodeToOpus = (codec) => new Promise((resolve, reject) => {
+          execFile("ffmpeg", ["-y", "-i", inWav, "-c:a", codec, "-b:a", "32k", "-vbr", "on", "-application", "voip", outOgg], (err) => {
+            if (err) return reject(err);
+            if (!fs.existsSync(outOgg) || fs.statSync(outOgg).size === 0) return reject(new Error("Ogg vacio"));
+            resolve(fs.readFileSync(outOgg));
+          });
+        });
+
+        let oggBuf;
+        try {
+          oggBuf = await transcodeToOpus("libopus");
+        } catch (e1) {
+          console.warn("[Audio] Reintentando transcode con codec opus...");
+          try {
+            oggBuf = await transcodeToOpus("opus");
+          } catch (e2) {
+            console.error("[Audio] Fallo transcode ffmpeg:", e2.message);
+            oggBuf = audioBuf;
+          }
+        } finally {
+          try { if (fs.existsSync(inWav)) fs.unlinkSync(inWav); } catch (_) {}
+          try { if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg); } catch (_) {}
+        }
+
+        const isOgg = (oggBuf !== audioBuf);
         const sent = await sock.sendMessage(chat, {
-          audio: audioBuf,
-          mimetype: "audio/mp4",
+          audio: oggBuf,
+          mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
           ptt: true
         });
+
+        // Guardar WAV original para que la consola EspOS pueda reproducir su propio audio de inmediato
+        if (sent?.key?.id) {
+          const safeAudioId = sent.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+          try {
+            fs.writeFileSync(path.join(audioFolder, `${safeAudioId}.wav`), audioBuf);
+          } catch (_) {}
+        }
 
         const ts = Math.floor(Date.now() / 1000);
         const timeStr = formatearHoraMensaje(ts);
@@ -1239,7 +1296,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.8.0] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.8.2] Activo en puerto ${PORT}`);
   startWhatsApp();
 
   // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
