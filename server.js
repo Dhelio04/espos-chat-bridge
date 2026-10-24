@@ -247,6 +247,19 @@ function resolverNombre(jid, pushName, fromMe) {
     return pushName;
   }
 
+  // 2.5 Buscar si en el historial de mensajes el emisor dejo su pushName o nombre real
+  const histMsgs = messagesCache.get(jid) || (alt ? messagesCache.get(alt) : null);
+  if (Array.isArray(histMsgs)) {
+    for (const m of histMsgs) {
+      if (!m.fromMe && m.sender && m.sender !== "Contacto" && m.sender !== myName && !m.sender.startsWith("Contacto WA") && !m.sender.startsWith("+")) {
+        contactsMap.set(jid, m.sender);
+        if (alt) contactsMap.set(alt, m.sender);
+        programarGuardadoDisco();
+        return m.sender;
+      }
+    }
+  }
+
   // 3. Preservar nombre previo en chatsCache si ya era un nombre real
   if (chatsCache.has(jid)) {
     const cName = chatsCache.get(jid).name;
@@ -432,6 +445,18 @@ async function startWhatsApp() {
     if (Array.isArray(contacts)) {
       for (const c of contacts) guardarContacto(c);
     }
+    if (Array.isArray(messages)) {
+      for (const m of messages) {
+        if (m.key?.remoteJid && m.pushName && m.pushName !== myName) {
+          const rj = m.key.remoteJid;
+          contactsMap.set(rj, m.pushName);
+          const altRj = lidToJid.get(rj) || jidToLid.get(rj);
+          if (altRj) contactsMap.set(altRj, m.pushName);
+          if (chatsCache.has(rj)) chatsCache.get(rj).name = m.pushName;
+          if (altRj && chatsCache.has(altRj)) chatsCache.get(altRj).name = m.pushName;
+        }
+      }
+    }
     if (Array.isArray(chats)) {
       for (const c of chats) {
         if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
@@ -596,6 +621,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   // API Status
+  if (pathname === "/api/contacto/renombrar" && (req.method === "POST" || req.method === "GET")) {
+    const cJid = parsedUrl.query.chat;
+    const cNom = parsedUrl.query.nombre;
+    if (cJid && cNom) {
+      contactsMap.set(cJid, cNom.trim());
+      const altJid = lidToJid.get(cJid) || jidToLid.get(cJid);
+      if (altJid) contactsMap.set(altJid, cNom.trim());
+      if (chatsCache.has(cJid)) chatsCache.get(cJid).name = cNom.trim();
+      if (altJid && chatsCache.has(altJid)) chatsCache.get(altJid).name = cNom.trim();
+      programarGuardadoDisco();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, jid: cJid, nombre: cNom.trim() }));
+    }
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "Faltan parametros chat y nombre" }));
+  }
+
   if (pathname === "/api/status" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -1100,8 +1142,18 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.5.5] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.6.4] Activo en puerto ${PORT}`);
   startWhatsApp();
+
+  // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
+  setInterval(() => {
+    try {
+      const sUrl = process.env.RENDER_EXTERNAL_URL || "https://espos-chat-bridge.onrender.com";
+      const pingUrl = `${sUrl}/api/status`;
+      const mod = pingUrl.startsWith("https") ? require("https") : require("http");
+      mod.get(pingUrl, (r) => { r.on("data", () => {}); }).on("error", () => {});
+    } catch (e) {}
+  }, 9 * 60 * 1000);
 });
 if (String(PORT) !== "3000") {
   try {
