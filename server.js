@@ -297,19 +297,26 @@ function guardarContacto(c) {
     lidToJid.set(c.lid, c.id);
     jidToLid.set(c.id, c.lid);
   }
-  // c.name es el nombre real guardado en el telefono del usuario
-  if (c.name && c.name !== myName) {
+  // c.name es el nombre real guardado en la agenda de Google Contacts / telefono del usuario
+  if (c.name && c.name !== myName && !c.name.startsWith("+") && !c.name.startsWith("Contacto WA")) {
     if (c.id) agendaMap.set(c.id, c.name);
     if (c.lid) agendaMap.set(c.lid, c.name);
     if (chatsCache.has(c.id)) chatsCache.get(c.id).name = c.name;
     if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = c.name;
     programarGuardadoDisco();
   }
-  // c.notify / pushName es el apodo del contacto
+  // c.notify / pushName es el apodo secundario que el emisor se puso a si mismo
   const apodo = c.notify || c.verifiedName;
   if (apodo && apodo !== myName) {
     if (c.id) pushNameMap.set(c.id, apodo);
     if (c.lid) pushNameMap.set(c.lid, apodo);
+    // Solo asignar a chatsCache si NO hay un nombre en agendaMap
+    if (c.id && (!agendaMap.has(c.id) || !agendaMap.get(c.id))) {
+      if (chatsCache.has(c.id)) {
+        const cur = chatsCache.get(c.id).name;
+        if (!cur || cur.startsWith("+") || cur.startsWith("Contacto WA")) chatsCache.get(c.id).name = apodo;
+      }
+    }
     programarGuardadoDisco();
   }
 }
@@ -404,6 +411,7 @@ function procesarMensaje(msg, esEnVivo = true) {
   } else if (prev && (!prev.name || prev.name.startsWith("Contacto WA") || prev.name.startsWith("+"))) {
     prev.name = name;
   }
+  programarGuardadoDisco();
 }
 
 async function startWhatsApp() {
@@ -466,11 +474,9 @@ async function startWhatsApp() {
       for (const m of messages) {
         if (m.key?.remoteJid && m.pushName && m.pushName !== myName) {
           const rj = m.key.remoteJid;
-          contactsMap.set(rj, m.pushName);
+          pushNameMap.set(rj, m.pushName);
           const altRj = lidToJid.get(rj) || jidToLid.get(rj);
-          if (altRj) contactsMap.set(altRj, m.pushName);
-          if (chatsCache.has(rj)) chatsCache.get(rj).name = m.pushName;
-          if (altRj && chatsCache.has(altRj)) chatsCache.get(altRj).name = m.pushName;
+          if (altRj) pushNameMap.set(altRj, m.pushName);
         }
       }
     }
@@ -531,7 +537,7 @@ async function startWhatsApp() {
   const onContacts = (list) => {
     for (const c of list) {
       guardarContacto(c);
-      const nom = c.name || c.notify || c.verifiedName;
+      const nom = resolverNombre(c.id, c.notify || c.verifiedName, false);
       if (c && nom && nom !== myName) {
         if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
         if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
@@ -1159,7 +1165,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.6.4] Activo en puerto ${PORT}`);
+  console.log(`[EspCHAT Bridge v2.7.1] Activo en puerto ${PORT}`);
   startWhatsApp();
 
   // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
