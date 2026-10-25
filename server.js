@@ -50,6 +50,7 @@ let myNumber = "";
 let myName = "";
 let myLid = "75798220378356@lid";
 let currentQR = "";
+let rawQR = "";
 let chatsCache = new Map();
 let messagesCache = new Map();
 let agendaMap = new Map();   // JID / LID -> Nombre guardado por el usuario en su agenda (Google Contacts)
@@ -542,6 +543,7 @@ async function startWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      rawQR = qr;
       currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
       isConnected = false;
     }
@@ -779,7 +781,8 @@ const server = http.createServer(async (req, res) => {
       conectado: isConnected,
       usuario: myName,
       numero: myNumber,
-      totalChats: chatsCache.size
+      totalChats: chatsCache.size,
+      qr: isConnected ? "" : (rawQR || "")
     }));
   }
 
@@ -945,6 +948,7 @@ const server = http.createServer(async (req, res) => {
       usuario: myName,
       numero: myNumber,
       totalChats: chatsCache.size,
+      qr: isConnected ? "" : (rawQR || ""),
       chats: list,
       llamadas: callsList
     }));
@@ -1176,6 +1180,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Endpoint de Fotos y Portadas de Video One UI: entrega 480x320 RGB565 o JPEG para galeria
+  
+  // Endpoint de QR para vinculacion nativa en pantalla ESP32
+  if (pathname === "/api/qr" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      conectado: isConnected,
+      qr: isConnected ? "" : (rawQR || "")
+    }));
+  }
+
   if (pathname === "/api/foto" && req.method === "GET") {
     const msgId = parsedUrl.query.id;
     const modo = parsedUrl.query.modo || "full"; // "full" (480x320 RGB565) o "jpg" (JPEG para Galería)
