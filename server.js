@@ -22,6 +22,8 @@ const PORT = process.env.PORT || 3000;
 const authFolder = path.join(__dirname, "auth_info_baileys");
 const avatarsFolder = path.join(__dirname, "avatars_cache");
 const stickersFolder = path.join(__dirname, "stickers_cache");
+const photosFolder   = path.join(__dirname, "photos_cache");
+if (!fs.existsSync(photosFolder)) fs.mkdirSync(photosFolder, { recursive: true });
 const audioFolder = path.join(__dirname, "audio_cache");
 if (!fs.existsSync(avatarsFolder)) fs.mkdirSync(avatarsFolder, { recursive: true });
 if (!fs.existsSync(stickersFolder)) fs.mkdirSync(stickersFolder, { recursive: true });
@@ -379,9 +381,9 @@ function procesarMensaje(msg, esEnVivo = true) {
   if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
   if (innerMsg?.documentWithCaptionMessage?.message) innerMsg = innerMsg.documentWithCaptionMessage.message;
 
-  if (msg.key?.id && (innerMsg?.stickerMessage || innerMsg?.audioMessage || innerMsg?.imageMessage)) {
+  if (msg.key?.id && (innerMsg?.stickerMessage || innerMsg?.audioMessage || innerMsg?.imageMessage || innerMsg?.videoMessage)) {
     rawMediaMap.set(msg.key.id, msg);
-    if (rawMediaMap.size > 300) {
+    if (rawMediaMap.size > 500) {
       const k = rawMediaMap.keys().next().value;
       rawMediaMap.delete(k);
     }
@@ -453,15 +455,25 @@ function procesarMensaje(msg, esEnVivo = true) {
   const lista = messagesCache.get(jid);
   const mStatus = msg.status || (fromMe ? 2 : 0);
   const isRead = Boolean(mStatus === 4 || mStatus === 5);
-    let durSec = 0;
+  let durSec = 0;
+  let tipoMsg = "texto";
   if (innerMsg?.audioMessage?.seconds) {
     durSec = Math.round(Number(innerMsg.audioMessage.seconds));
+    tipoMsg = "audio";
+  } else if (innerMsg?.stickerMessage) {
+    tipoMsg = "sticker";
+  } else if (innerMsg?.imageMessage) {
+    tipoMsg = "foto";
+  } else if (innerMsg?.videoMessage) {
+    tipoMsg = "video";
+    durSec = Math.round(Number(innerMsg.videoMessage.seconds) || 0);
   }
   lista.push({
     id: msg.key.id,
     fromMe,
     sender: msg.pushName || (fromMe ? "T\u00fa" : "Contacto"),
     text,
+    tipo: tipoMsg,
     time: timeStr,
     timestamp: ts,
     duration: durSec,
@@ -1160,6 +1172,107 @@ const server = http.createServer(async (req, res) => {
     } catch (se) {
       console.error("[Sticker] Error procesando sticker:", se.message);
       res.writeHead(500); return res.end();
+    }
+  }
+
+  // Endpoint de Fotos y Portadas de Video One UI: entrega 480x320 RGB565 o JPEG para galeria
+  if (pathname === "/api/foto" && req.method === "GET") {
+    const msgId = parsedUrl.query.id;
+    const modo = parsedUrl.query.modo || "full"; // "full" (480x320 RGB565) o "jpg" (JPEG para Galería)
+    if (!msgId) { res.writeHead(400); return res.end("Falta id"); }
+    try {
+      const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const rawPath = path.join(photosFolder, `${safeId}_${modo}.raw`);
+      const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
+
+      if (modo === "jpg" && fs.existsSync(jpgPath)) {
+        res.writeHead(200, {
+          "Content-Type": "image/jpeg",
+          "Cache-Control": "public, max-age=604800"
+        });
+        return fs.createReadStream(jpgPath).pipe(res);
+      }
+
+      if (modo === "full" && fs.existsSync(rawPath)) {
+        const rawBuf = fs.readFileSync(rawPath);
+        if (rawBuf.length === 480 * 320 * 2) {
+          res.writeHead(200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": rawBuf.length,
+            "Cache-Control": "public, max-age=604800"
+          });
+          return res.end(rawBuf);
+        }
+      }
+
+      const rawMsg = rawMediaMap.get(msgId);
+      if (!rawMsg) { res.writeHead(404); return res.end("Foto no en memoria"); }
+      if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
+
+      let inner = rawMsg.message;
+      if (inner?.ephemeralMessage?.message) inner = inner.ephemeralMessage.message;
+      if (inner?.viewOnceMessage?.message) inner = inner.viewOnceMessage.message;
+      if (inner?.viewOnceMessageV2?.message) inner = inner.viewOnceMessageV2.message;
+      if (inner?.documentWithCaptionMessage?.message) inner = inner.documentWithCaptionMessage.message;
+
+      let mediaBuf = null;
+      if (inner?.videoMessage?.jpegThumbnail) {
+        mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
+      } else {
+        mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+          logger: pino({ level: "silent" }),
+          reuploadRequest: sock?.updateMediaMessage
+        });
+      }
+
+      if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+
+      // 1. Guardar copia en JPEG para la Galería si se pide o para cache
+      if (!fs.existsSync(jpgPath) || modo === "jpg") {
+        const jpgBuf = await sharp(mediaBuf)
+          .resize(480, 320, { fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 85, progressive: false })
+          .toBuffer();
+        fs.writeFileSync(jpgPath, jpgBuf);
+        if (modo === "jpg") {
+          res.writeHead(200, {
+            "Content-Type": "image/jpeg",
+            "Content-Length": jpgBuf.length,
+            "Cache-Control": "public, max-age=604800"
+          });
+          return res.end(jpgBuf);
+        }
+      }
+
+      // 2. Generar formato directo RGB565 Little-Endian (480x320 = 307200 bytes)
+      const resObj = await sharp(mediaBuf)
+        .resize(480, 320, { fit: "contain", background: { r: 9, g: 13, b: 18, alpha: 1 } })
+        .flatten({ background: { r: 9, g: 13, b: 18 } })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      const data = resObj.data;
+      const channels = resObj.info.channels || 3;
+      const rgb565 = Buffer.alloc(480 * 320 * 2);
+      for (let i = 0; i < 480 * 320; i++) {
+        const r = data[i * channels];
+        const g = data[i * channels + 1];
+        const b = data[i * channels + 2];
+        const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        rgb565.writeUInt16LE(c16, i * 2);
+      }
+
+      fs.writeFileSync(rawPath, rgb565);
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": rgb565.length,
+        "Cache-Control": "public, max-age=604800"
+      });
+      return res.end(rgb565);
+    } catch (fe) {
+      console.log(`[Foto] Error al procesar ${msgId}:`, fe.message);
+      res.writeHead(500);
+      return res.end();
     }
   }
 
