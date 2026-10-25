@@ -46,6 +46,7 @@ let sock = null;
 let isConnected = false;
 let myNumber = "";
 let myName = "";
+let myLid = "75798220378356@lid";
 let currentQR = "";
 let chatsCache = new Map();
 let messagesCache = new Map();
@@ -274,7 +275,10 @@ function extraerTexto(raw) {
 
 function resolverNombre(jid, pushName, fromMe) {
   if (!jid) return "Contacto";
-  if (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
+  const esPropio = (myNumber && jid.includes(myNumber)) ||
+                   (myLid && (jid === myLid || jid.startsWith(myLid.split("@")[0]))) ||
+                   (jid === "75798220378356@lid");
+  if (esPropio && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
   
   const alt = lidToJid.get(jid) || jidToLid.get(jid);
 
@@ -357,8 +361,16 @@ function guardarContacto(c) {
 
 function procesarMensaje(msg, esEnVivo = true) {
   if (!msg || !msg.message) return;
-  const jid = msg.key?.remoteJid;
+  let jid = msg.key?.remoteJid;
   if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
+
+  // Unificar chat propio: si el mensaje proviene o va a mi LID o a mi numero, normalizarlo siempre a myJid
+  const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+  const esPropio = (jid === myLid) || (jid === "75798220378356@lid") ||
+                   (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us"));
+  if (esPropio) {
+    jid = myJid;
+  }
 
   // Registrar en rawMediaMap si tiene sticker o audio para descarga bajo demanda
   let innerMsg = msg.message;
@@ -538,7 +550,18 @@ async function startWhatsApp() {
       currentQR = "";
       myNumber = sock.user.id.split(":")[0];
       myName = sock.user.name || "Gab";
-      console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber})`);
+      if (sock.user.lid) {
+        myLid = sock.user.lid.split(":")[0] + "@lid";
+      }
+      if (!myLid && myNumber === "51933961359") {
+        myLid = "75798220378356@lid";
+      }
+      const myJid = `${myNumber}@s.whatsapp.net`;
+      if (myLid) {
+        lidToJid.set(myLid, myJid);
+        jidToLid.set(myJid, myLid);
+      }
+      console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
       sincronizarGruposReales();
     }
   });
@@ -788,6 +811,48 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+    const myLidStr = myLid || "75798220378356@lid";
+
+    // Unificar cualquier rastro de mi propio LID dentro de myJid ("Mensajes Guardados (Tú)")
+    for (const lidKey of [myLidStr, "75798220378356@lid"]) {
+      if (chatsCache.has(lidKey)) {
+        const cLid = chatsCache.get(lidKey);
+        const cJid = chatsCache.get(myJid);
+        if (cJid && cLid) {
+          if ((Number(cLid.timestamp) || 0) >= (Number(cJid.timestamp) || 0)) {
+            cJid.lastMsg = cLid.lastMsg;
+            cJid.time = cLid.time;
+            cJid.timestamp = cLid.timestamp;
+            cJid.fromMe = cLid.fromMe;
+          }
+        } else if (!cJid && cLid) {
+          cLid.id = myJid;
+          cLid.name = "Mensajes Guardados (Tú)";
+          chatsCache.set(myJid, cLid);
+        }
+        chatsCache.delete(lidKey);
+      }
+      if (messagesCache.has(lidKey)) {
+        const msgsLid = messagesCache.get(lidKey) || [];
+        const msgsJid = messagesCache.get(myJid) || [];
+        const ids = new Set(msgsJid.map(m => m.id));
+        for (const m of msgsLid) {
+          if (!ids.has(m.id)) {
+            msgsJid.push(m);
+            ids.add(m.id);
+          }
+        }
+        msgsJid.sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
+        while (msgsJid.length > 30) msgsJid.shift();
+        messagesCache.set(myJid, msgsJid);
+        messagesCache.delete(lidKey);
+      }
+    }
+    if (chatsCache.has(myJid)) {
+      chatsCache.get(myJid).name = "Mensajes Guardados (Tú)";
+    }
+
     const vistanombres = new Set();
     const sorted = Array.from(chatsCache.values())
       .filter(c => c && c.id)
@@ -874,7 +939,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/api/mensajes" && req.method === "GET") {
-    const chatJid = parsedUrl.query.chat;
+    let chatJid = parsedUrl.query.chat;
+    const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+    const myLidStr = myLid || "75798220378356@lid";
+    if (chatJid === myLidStr || chatJid === "75798220378356@lid" || (myNumber && chatJid && chatJid.includes(myNumber) && !chatJid.endsWith("@g.us"))) {
+      chatJid = myJid;
+    }
     if (sock && chatJid) {
       sock.presenceSubscribe(chatJid).catch(() => {});
       const altJid = lidToJid.get(chatJid) || jidToLid.get(chatJid);
@@ -1150,7 +1220,12 @@ const server = http.createServer(async (req, res) => {
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
-        const { chat, texto } = JSON.parse(body);
+        let { chat, texto } = JSON.parse(body);
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+        const myLidStr = myLid || "75798220378356@lid";
+        if (chat === myLidStr || chat === "75798220378356@lid" || (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us"))) {
+          chat = sock?.user?.id || myJid;
+        }
         if (!chat || !texto || !sock) {
           res.writeHead(400); return res.end();
         }
