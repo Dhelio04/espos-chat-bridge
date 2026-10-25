@@ -83,9 +83,11 @@ function cargarStoreDisco() {
         for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
       }
       if (data.messages) {
+        const ahoraSeg = Math.floor(Date.now() / 1000);
         for (const [k, v] of Object.entries(data.messages)) {
           if (Array.isArray(v)) {
-            const recientes = v.slice(-30);
+            // Solo restaurar mensajes recientes de las ultimas 24 horas para evitar revivir historiales obsoletos
+            const recientes = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
             if (recientes.length > 0) messagesCache.set(k, recientes);
           }
         }
@@ -133,6 +135,14 @@ function programarGuardadoDisco() {
   if (guardarTimer) clearTimeout(guardarTimer);
   guardarTimer = setTimeout(() => {
     try {
+      const ahoraSeg = Math.floor(Date.now() / 1000);
+      const msgsFrescos = {};
+      for (const [k, v] of messagesCache.entries()) {
+        if (Array.isArray(v)) {
+          const filtrados = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
+          if (filtrados.length > 0) msgsFrescos[k] = filtrados;
+        }
+      }
       const payload = {
         agenda: Object.fromEntries(agendaMap.entries()),
         pushNames: Object.fromEntries(pushNameMap.entries()),
@@ -140,7 +150,7 @@ function programarGuardadoDisco() {
         lidToJid: Object.fromEntries(lidToJid.entries()),
         jidToLid: Object.fromEntries(jidToLid.entries()),
         chats: Object.fromEntries(chatsCache.entries()),
-        messages: Object.fromEntries(messagesCache.entries()),
+        messages: msgsFrescos,
         rawMedia: Object.fromEntries(Array.from(rawMediaMap.entries()).slice(-100))
       };
       fs.writeFileSync(storeFile, JSON.stringify(payload));
@@ -751,26 +761,28 @@ const server = http.createServer(async (req, res) => {
         }
       }
     } catch (_) {}
-    guardarStoreDisco();
+    programarGuardadoDisco();
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, mensaje: "Cache de mensajes y stickers vaciado con exito (solo 30 ultimos activos)" }));
   }
 
   if (pathname === "/api/chats" && req.method === "GET") {
-    // Sincronizar chatsCache con el mensaje mas reciente de messagesCache antes de ordenar
+    // Sincronizar chatsCache con el mensaje mas reciente de messagesCache solo si es mas nuevo
     for (const [jid, mList] of messagesCache.entries()) {
       if (Array.isArray(mList) && mList.length > 0) {
         const ult = mList[mList.length - 1];
         if (ult) {
           const c = chatsCache.get(jid) || { id: jid, name: contactsMap.get(jid) || resolverNombre(jid, "", false), unread: 0 };
-          if (ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
-            c.lastMsg = ult.text;
+          const ultTs = Number(ult.timestamp) || 0;
+          const curTs = Number(c.timestamp) || 0;
+          if (ultTs >= curTs || !c.lastMsg) {
+            if (ult.text && !ult.text.includes("Conversaci") && !ult.text.includes("Toca para")) {
+              c.lastMsg = ult.text;
+            }
+            if (ult.time) c.time = ult.time;
+            if (ultTs > 0) c.timestamp = ultTs;
+            c.fromMe = Boolean(ult.fromMe);
           }
-          if (ult.time) c.time = ult.time;
-          if (ult.timestamp && (!c.timestamp || ult.timestamp >= c.timestamp || !c.lastMsg)) {
-            c.timestamp = ult.timestamp;
-          }
-          c.fromMe = Boolean(ult.fromMe);
           chatsCache.set(jid, c);
         }
       }
@@ -869,10 +881,10 @@ const server = http.createServer(async (req, res) => {
       if (altJid) sock.presenceSubscribe(altJid).catch(() => {});
     }
 
-    let msgs = messagesCache.get(chatJid) || [];
-    if (msgs.length === 0) {
-      const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
-      if (alt && messagesCache.has(alt)) msgs = messagesCache.get(alt);
+    let msgs = [...(messagesCache.get(chatJid) || [])];
+    const alt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
+    if (msgs.length === 0 && alt && messagesCache.has(alt)) {
+      msgs = [...messagesCache.get(alt)];
     }
     // Si no hay mensajes, intentar buscar por otro chat con el mismo nombre
     if (msgs.length === 0 && chatsCache.has(chatJid)) {
@@ -881,7 +893,7 @@ const server = http.createServer(async (req, res) => {
         for (const [otherJid, otherChat] of chatsCache.entries()) {
           if (otherJid !== chatJid && (otherChat.name || "").trim().toLowerCase() === cNom) {
             if (messagesCache.has(otherJid) && messagesCache.get(otherJid).length > 0) {
-              msgs = messagesCache.get(otherJid);
+              msgs = [...messagesCache.get(otherJid)];
               lidToJid.set(chatJid, otherJid);
               jidToLid.set(otherJid, chatJid);
               break;
@@ -891,25 +903,23 @@ const server = http.createServer(async (req, res) => {
       }
     }
     // Incorporar el mensaje mas reciente de chatsCache si messagesCache esta vacio o desfasado
-    if (chatsCache.has(chatJid)) {
-      const info = chatsCache.get(chatJid);
-      if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
-        const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
-        const infoTs = Number(info.timestamp || 0);
+    const info = chatsCache.get(chatJid) || (alt ? chatsCache.get(alt) : null);
+    if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
+      const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
+      const infoTs = Number(info.timestamp || 0);
 
-        // Incorporar el mensaje mas reciente si la lista esta vacia o infoTs es mas nuevo
-        if (msgs.length === 0 || (infoTs > 0 && infoTs > lastMsgTs)) {
-          const fm = Boolean(info.fromMe);
-          msgs.push({
-            id: "latest_" + (infoTs || Date.now()),
-            fromMe: fm,
-            sender: fm ? (myName || "Tú") : (info.name || "Contacto"),
-            text: info.lastMsg,
-            time: info.time || "",
-            timestamp: infoTs || Math.floor(Date.now() / 1000),
-            read: true
-          });
-        }
+      // Incorporar el mensaje mas reciente si la lista esta vacia o infoTs es mas nuevo
+      if (msgs.length === 0 || (infoTs > 0 && infoTs > lastMsgTs)) {
+        const fm = Boolean(info.fromMe);
+        msgs.push({
+          id: "latest_" + (infoTs || Date.now()),
+          fromMe: fm,
+          sender: fm ? (myName || "Tú") : (info.name || "Contacto"),
+          text: info.lastMsg,
+          time: info.time || "",
+          timestamp: infoTs || Math.floor(Date.now() / 1000),
+          read: true
+        });
       }
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
