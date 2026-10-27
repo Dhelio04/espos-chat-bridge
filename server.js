@@ -527,9 +527,18 @@ async function startWhatsApp() {
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: true,
       getMessage: async (key) => {
-        if (!key?.remoteJid) return undefined;
-        const list = messagesCache.get(key.remoteJid);
-        if (list) {
+        if (!key?.id) return undefined;
+        // 1. Buscar en el mapa rapido de mensajes completos (por ID)
+        if (allMessagesMap.has(key.id)) {
+          return allMessagesMap.get(key.id);
+        }
+        // 2. Buscar en la cache de mensajes por remoteJid si existe
+        if (key.remoteJid && messagesCache.has(key.remoteJid)) {
+          const m = messagesCache.get(key.remoteJid).find(x => x.id === key.id);
+          if (m) return { conversation: m.text };
+        }
+        // 3. Buscar en todas las listas de messagesCache
+        for (const list of messagesCache.values()) {
           const m = list.find(x => x.id === key.id);
           if (m) return { conversation: m.text };
         }
@@ -666,7 +675,16 @@ async function startWhatsApp() {
   sock.ev.on("contacts.update", onContacts);
 
   sock.ev.on("messages.upsert", ({ messages, type }) => {
-    for (const m of messages) procesarMensaje(m, true);
+    for (const m of messages) {
+      if (m.key?.id && m.message) {
+        allMessagesMap.set(m.key.id, m.message);
+        if (allMessagesMap.size > 800) {
+          const firstKey = allMessagesMap.keys().next().value;
+          allMessagesMap.delete(firstKey);
+        }
+      }
+      procesarMensaje(m, true);
+    }
   });
 
   sock.ev.on("presence.update", ({ id, presences }) => {
@@ -1374,16 +1392,29 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         let { chat, texto } = JSON.parse(body);
-        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
         const myLidStr = myLid || "75798220378356@lid";
-        if (chat === myLidStr || chat === "75798220378356@lid" || (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us"))) {
-          chat = sock?.user?.id || myJid;
+        
+        // Normalizacion estricta para mensajes a uno mismo ("Mensajes Guardados (Tu)")
+        // Usar SIEMPRE jidNormalizedUser para que WhatsApp E2EE lo entregue al telefono primario
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        
+        if (isSelf) {
+          chat = jidNormalizedUser(sock?.user?.id || myJid);
+        } else {
+          chat = jidNormalizedUser(chat);
         }
+
         if (!chat || !texto || !sock) {
           res.writeHead(400); return res.end();
         }
 
         const sent = await sock.sendMessage(chat, { text: texto });
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
+        }
         const ts = Math.floor(Date.now() / 1000);
         const timeStr = formatearHoraMensaje(ts);
         const timeRel = formatearHora(ts);
@@ -1476,12 +1507,22 @@ const server = http.createServer(async (req, res) => {
           try { if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg); } catch (_) {}
         }
 
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
+        const myLidStr = myLid || "75798220378356@lid";
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
+
         const isOgg = (oggBuf !== audioBuf);
-        const sent = await sock.sendMessage(chat, {
+        const sent = await sock.sendMessage(targetChat, {
           audio: oggBuf,
           mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
           ptt: true
         });
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message);
+        }
 
         // Guardar WAV original para que la consola EspOS pueda reproducir su propio audio de inmediato
         if (sent?.key?.id) {
