@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
@@ -521,7 +521,10 @@ async function startWhatsApp() {
       version,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
+      },
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
@@ -674,6 +677,12 @@ async function startWhatsApp() {
   sock.ev.on("contacts.upsert", onContacts);
   sock.ev.on("contacts.update", onContacts);
 
+    sock.ev.on("groups.update", async (updates) => {
+    for (const u of updates) { if (u?.id) groupMetaCache.delete(u.id); }
+  });
+  sock.ev.on("group-participants.update", async (update) => {
+    if (update?.id) groupMetaCache.delete(update.id);
+  });
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     for (const m of messages) {
       if (m.key?.id && m.message) {
@@ -848,6 +857,63 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Endpoint de diagnostico avanzado
+  if (pathname === "/api/diag" && req.method === "GET") {
+    let authFiles = [];
+    try {
+      if (fs.existsSync(authFolder)) {
+        authFiles = fs.readdirSync(authFolder);
+      }
+    } catch (e) {}
+    const sessionFiles = authFiles.filter(f => f.startsWith("session-"));
+    const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      version: "2.9.5",
+      uptime: Math.round(process.uptime()),
+      connected: isConnected,
+      myNumber,
+      myLid,
+      sockUserId: sock?.user?.id || null,
+      authFolderExists: fs.existsSync(authFolder),
+      credsExists: fs.existsSync(path.join(authFolder, "creds.json")),
+      sessionFilesCount: sessionFiles.length,
+      prekeyFilesCount: prekeyFiles.length,
+      sampleSessions: sessionFiles.filter(f => f.includes("51933961359") || f.includes("75798220378356")),
+      allMessagesMapSize: allMessagesMap.size,
+      groupsCached: groupMetaCache.size
+    }));
+  }
+
+  // Endpoint para purgar sesiones Signal desincronizadas (stale) conservando creds.json (sin nuevo QR)
+  if (pathname === "/api/limpiar_sesiones_e2ee" && req.method === "GET") {
+    let eliminados = 0;
+    try {
+      if (fs.existsSync(authFolder)) {
+        const files = fs.readdirSync(authFolder);
+        for (const file of files) {
+          if (file.startsWith("session-") || file.startsWith("pre-key-")) {
+            fs.unlinkSync(path.join(authFolder, file));
+            eliminados++;
+          }
+        }
+      }
+      if (sock) {
+        try { sock.end(); } catch (_) {}
+      }
+      setTimeout(startWhatsApp, 1500);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        ok: true,
+        archivosEliminados: eliminados,
+        mensaje: "Sesiones E2EE limpiadas con exito. creds.json conservado. Reiniciando handshake..."
+      }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  }
+
   if (pathname === "/api/chats" && req.method === "GET") {
     // Sincronizar chatsCache con el mensaje mas reciente de messagesCache solo si es mas nuevo
     for (const [jid, mList] of messagesCache.entries()) {
@@ -981,6 +1047,16 @@ const server = http.createServer(async (req, res) => {
       // Indicar si es canal
       if (c.id.endsWith("@newsletter")) {
         c.esCanal = true;
+      }
+      // Indicar si es grupo y si solo administradores pueden hablar
+      if (c.id.endsWith("@g.us")) {
+        c.esGrupo = true;
+        if (groupMetaCache.has(c.id)) {
+          c.soloAdmins = groupMetaCache.get(c.id).soloAdmins;
+        } else {
+          c.soloAdmins = false;
+          obtenerPermisosGrupo(c.id).catch(() => {});
+        }
       }
       list.push(c);
       if (list.length >= 50) break;
@@ -1411,6 +1487,13 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(400); return res.end();
         }
 
+        if (chat.endsWith("@g.us")) {
+          const restringido = await obtenerPermisosGrupo(chat);
+          if (restringido) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
+          }
+        }
         const sent = await sock.sendMessage(chat, { text: texto });
         if (sent?.key?.id) {
           allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
