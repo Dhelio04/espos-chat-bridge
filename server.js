@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
@@ -521,15 +521,27 @@ async function startWhatsApp() {
       version,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
+      },
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: true,
       getMessage: async (key) => {
-        if (!key?.remoteJid) return undefined;
-        const list = messagesCache.get(key.remoteJid);
-        if (list) {
+        if (!key?.id) return undefined;
+        // 1. Buscar en el mapa rapido de mensajes completos (por ID)
+        if (allMessagesMap.has(key.id)) {
+          return allMessagesMap.get(key.id);
+        }
+        // 2. Buscar en la cache de mensajes por remoteJid si existe
+        if (key.remoteJid && messagesCache.has(key.remoteJid)) {
+          const m = messagesCache.get(key.remoteJid).find(x => x.id === key.id);
+          if (m) return { conversation: m.text };
+        }
+        // 3. Buscar en todas las listas de messagesCache
+        for (const list of messagesCache.values()) {
           const m = list.find(x => x.id === key.id);
           if (m) return { conversation: m.text };
         }
@@ -665,8 +677,23 @@ async function startWhatsApp() {
   sock.ev.on("contacts.upsert", onContacts);
   sock.ev.on("contacts.update", onContacts);
 
+    sock.ev.on("groups.update", async (updates) => {
+    for (const u of updates) { if (u?.id) groupMetaCache.delete(u.id); }
+  });
+  sock.ev.on("group-participants.update", async (update) => {
+    if (update?.id) groupMetaCache.delete(update.id);
+  });
   sock.ev.on("messages.upsert", ({ messages, type }) => {
-    for (const m of messages) procesarMensaje(m, true);
+    for (const m of messages) {
+      if (m.key?.id && m.message) {
+        allMessagesMap.set(m.key.id, m.message);
+        if (allMessagesMap.size > 800) {
+          const firstKey = allMessagesMap.keys().next().value;
+          allMessagesMap.delete(firstKey);
+        }
+      }
+      procesarMensaje(m, true);
+    }
   });
 
   sock.ev.on("presence.update", ({ id, presences }) => {
@@ -830,6 +857,63 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Endpoint de diagnostico avanzado
+  if (pathname === "/api/diag" && req.method === "GET") {
+    let authFiles = [];
+    try {
+      if (fs.existsSync(authFolder)) {
+        authFiles = fs.readdirSync(authFolder);
+      }
+    } catch (e) {}
+    const sessionFiles = authFiles.filter(f => f.startsWith("session-"));
+    const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      version: "2.9.5",
+      uptime: Math.round(process.uptime()),
+      connected: isConnected,
+      myNumber,
+      myLid,
+      sockUserId: sock?.user?.id || null,
+      authFolderExists: fs.existsSync(authFolder),
+      credsExists: fs.existsSync(path.join(authFolder, "creds.json")),
+      sessionFilesCount: sessionFiles.length,
+      prekeyFilesCount: prekeyFiles.length,
+      sampleSessions: sessionFiles.filter(f => f.includes("51933961359") || f.includes("75798220378356")),
+      allMessagesMapSize: allMessagesMap.size,
+      groupsCached: groupMetaCache.size
+    }));
+  }
+
+  // Endpoint para purgar sesiones Signal desincronizadas (stale) conservando creds.json (sin nuevo QR)
+  if (pathname === "/api/limpiar_sesiones_e2ee" && req.method === "GET") {
+    let eliminados = 0;
+    try {
+      if (fs.existsSync(authFolder)) {
+        const files = fs.readdirSync(authFolder);
+        for (const file of files) {
+          if (file.startsWith("session-") || file.startsWith("pre-key-")) {
+            fs.unlinkSync(path.join(authFolder, file));
+            eliminados++;
+          }
+        }
+      }
+      if (sock) {
+        try { sock.end(); } catch (_) {}
+      }
+      setTimeout(startWhatsApp, 1500);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        ok: true,
+        archivosEliminados: eliminados,
+        mensaje: "Sesiones E2EE limpiadas con exito. creds.json conservado. Reiniciando handshake..."
+      }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  }
+
   if (pathname === "/api/chats" && req.method === "GET") {
     // Sincronizar chatsCache con el mensaje mas reciente de messagesCache solo si es mas nuevo
     for (const [jid, mList] of messagesCache.entries()) {
@@ -963,6 +1047,16 @@ const server = http.createServer(async (req, res) => {
       // Indicar si es canal
       if (c.id.endsWith("@newsletter")) {
         c.esCanal = true;
+      }
+      // Indicar si es grupo y si solo administradores pueden hablar
+      if (c.id.endsWith("@g.us")) {
+        c.esGrupo = true;
+        if (groupMetaCache.has(c.id)) {
+          c.soloAdmins = groupMetaCache.get(c.id).soloAdmins;
+        } else {
+          c.soloAdmins = false;
+          obtenerPermisosGrupo(c.id).catch(() => {});
+        }
       }
       list.push(c);
       if (list.length >= 50) break;
@@ -1374,16 +1468,36 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         let { chat, texto } = JSON.parse(body);
-        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
         const myLidStr = myLid || "75798220378356@lid";
-        if (chat === myLidStr || chat === "75798220378356@lid" || (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us"))) {
-          chat = sock?.user?.id || myJid;
+        
+        // Normalizacion estricta para mensajes a uno mismo ("Mensajes Guardados (Tu)")
+        // Usar SIEMPRE jidNormalizedUser para que WhatsApp E2EE lo entregue al telefono primario
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        
+        if (isSelf) {
+          chat = jidNormalizedUser(sock?.user?.id || myJid);
+        } else {
+          chat = jidNormalizedUser(chat);
         }
+
         if (!chat || !texto || !sock) {
           res.writeHead(400); return res.end();
         }
 
+        if (chat.endsWith("@g.us")) {
+          const restringido = await obtenerPermisosGrupo(chat);
+          if (restringido) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
+          }
+        }
         const sent = await sock.sendMessage(chat, { text: texto });
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
+        }
         const ts = Math.floor(Date.now() / 1000);
         const timeStr = formatearHoraMensaje(ts);
         const timeRel = formatearHora(ts);
@@ -1476,12 +1590,22 @@ const server = http.createServer(async (req, res) => {
           try { if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg); } catch (_) {}
         }
 
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
+        const myLidStr = myLid || "75798220378356@lid";
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
+
         const isOgg = (oggBuf !== audioBuf);
-        const sent = await sock.sendMessage(chat, {
+        const sent = await sock.sendMessage(targetChat, {
           audio: oggBuf,
           mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
           ptt: true
         });
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message);
+        }
 
         // Guardar WAV original para que la consola EspOS pueda reproducir su propio audio de inmediato
         if (sent?.key?.id) {
