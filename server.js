@@ -388,9 +388,13 @@ function procesarMensaje(msg, esEnVivo = true) {
       const k = rawMediaMap.keys().next().value;
       rawMediaMap.delete(k);
     }
-    // Precarga asincrona inmediata de stickers a formato RGB565 One UI
+    // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
     if (innerMsg?.stickerMessage && sharp) {
-      const sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+      let sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+      if (innerMsg.stickerMessage.fileSha256) {
+        sId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
+      }
+      if (sId !== msg.key.id) rawMediaMap.set(sId, msg);
       const rPath = path.join(stickersFolder, `${sId}.raw`);
       if (!fs.existsSync(rPath)) {
         downloadMediaMessage(msg, "buffer", {}, {
@@ -398,6 +402,7 @@ function procesarMensaje(msg, esEnVivo = true) {
           reuploadRequest: sock?.updateMediaMessage
         }).then(buf => {
           if (buf) {
+            try { fs.writeFileSync(path.join(stickersFolder, `${sId}.webp`), buf); } catch (_) {}
             return sharp(buf, { page: 0 })
               .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
               .flatten({ background: { r: 19, g: 27, b: 36 } })
@@ -458,11 +463,15 @@ function procesarMensaje(msg, esEnVivo = true) {
   const isRead = Boolean(mStatus === 4 || mStatus === 5);
   let durSec = 0;
   let tipoMsg = "texto";
+  let msgItemId = msg.key.id;
   if (innerMsg?.audioMessage?.seconds) {
     durSec = Math.round(Number(innerMsg.audioMessage.seconds));
     tipoMsg = "audio";
   } else if (innerMsg?.stickerMessage) {
     tipoMsg = "sticker";
+    if (innerMsg.stickerMessage.fileSha256) {
+      msgItemId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
+    }
   } else if (innerMsg?.imageMessage) {
     tipoMsg = "foto";
   } else if (innerMsg?.videoMessage) {
@@ -470,7 +479,7 @@ function procesarMensaje(msg, esEnVivo = true) {
     durSec = Math.round(Number(innerMsg.videoMessage.seconds) || 0);
   }
   lista.push({
-    id: msg.key.id,
+    id: msgItemId,
     fromMe,
     sender: msg.pushName || (fromMe ? "T\u00fa" : "Contacto"),
     text,
@@ -1269,6 +1278,7 @@ const server = http.createServer(async (req, res) => {
         reuploadRequest: sock?.updateMediaMessage
       });
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+      try { fs.writeFileSync(path.join(stickersFolder, `${safeId}.webp`), mediaBuf); } catch (_) {}
 
       const resObj = await sharp(mediaBuf, { page: 0 })
         .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
@@ -1494,7 +1504,54 @@ const server = http.createServer(async (req, res) => {
             return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
           }
         }
-        const sent = await sock.sendMessage(chat, { text: texto });
+        let sent;
+        let isStk = false;
+        const stkMatch = (typeof texto === "string") ? texto.match(/^\[Sticker:(.+)\]$/) : null;
+        if (stkMatch) {
+          isStk = true;
+          const stkId = stkMatch[1].replace(/[^a-zA-Z0-9_-]/g, "_");
+          const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+          const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+          if (fs.existsSync(webpPath)) {
+            sent = await sock.sendMessage(chat, { sticker: fs.readFileSync(webpPath) });
+          } else if (rawMediaMap.has(stkId)) {
+            try {
+              const rawMsg = rawMediaMap.get(stkId);
+              const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock?.updateMediaMessage
+              });
+              if (mediaBuf) {
+                try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
+                sent = await sock.sendMessage(chat, { sticker: mediaBuf });
+              }
+            } catch (_) {}
+          }
+          if (!sent && fs.existsSync(rawPath) && sharp) {
+            try {
+              const rawBuf = fs.readFileSync(rawPath);
+              const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+              for (let i = 0; i < 64 * 64; i++) {
+                const c16 = rawBuf.readUInt16LE(i * 2);
+                const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+                const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+                const b = (c16 & 0x1F) * 255 / 31;
+                rgbaBuf[i * 4] = Math.round(r);
+                rgbaBuf[i * 4 + 1] = Math.round(g);
+                rgbaBuf[i * 4 + 2] = Math.round(b);
+                rgbaBuf[i * 4 + 3] = 255;
+              }
+              const webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } }).webp().toBuffer();
+              sent = await sock.sendMessage(chat, { sticker: webpBuf });
+            } catch (_) {}
+          }
+          if (!sent) {
+            sent = await sock.sendMessage(chat, { text: "[Sticker]" });
+          }
+        } else {
+          sent = await sock.sendMessage(chat, { text: texto });
+        }
+        const displayTxt = isStk ? "[Sticker]" : texto;
         if (sent?.key?.id) {
           allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
         }
@@ -1506,7 +1563,7 @@ const server = http.createServer(async (req, res) => {
           id: sent.key.id,
           fromMe: true,
           sender: myName || "Tú",
-          text: texto,
+          text: displayTxt,
           time: timeStr,
           timestamp: ts,
           status: 2,
@@ -1526,7 +1583,7 @@ const server = http.createServer(async (req, res) => {
 
         if (chatsCache.has(chat)) {
           const c = chatsCache.get(chat);
-          c.lastMsg = texto;
+          c.lastMsg = displayTxt;
           c.time = timeRel;
           c.timestamp = ts;
           c.fromMe = true;
