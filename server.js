@@ -1710,6 +1710,112 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+
+  // API Enviar Sticker Nativo One UI (entrega stream 64x64 RGB565 -> WebP 512x512)
+  if (pathname === "/api/enviar_sticker" && req.method === "POST") {
+    let chat = parsedUrl.query.chat;
+    const stkId = (parsedUrl.query.id || ("stk_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (!chat || !sock) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
+    }
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", async () => {
+      try {
+        const rawBuf = Buffer.concat(chunks);
+        if (rawBuf.length !== 64 * 64 * 2) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sticker invalido: debe ser 64x64 RGB565 (8192 bytes)" }));
+        }
+
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
+        const myLidStr = myLid || "75798220378356@lid";
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
+
+        // Convertir RGB565 Little-Endian (64x64) a RGBA
+        const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+        for (let i = 0; i < 64 * 64; i++) {
+          const c16 = rawBuf.readUInt16LE(i * 2);
+          const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+          const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+          const b = (c16 & 0x1F) * 255 / 31;
+          rgbaBuf[i * 4] = Math.round(r);
+          rgbaBuf[i * 4 + 1] = Math.round(g);
+          rgbaBuf[i * 4 + 2] = Math.round(b);
+          rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
+        }
+
+        let webpBuf;
+        if (sharp) {
+          webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
+            .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp({ quality: 90 })
+            .toBuffer();
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
+        }
+
+        const sent = await sock.sendMessage(targetChat, {
+          sticker: webpBuf
+        });
+
+        // Guardar en cache del servidor
+        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+        try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {}
+        try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
+          rawMediaMap.set(sent.key.id, sent);
+          rawMediaMap.set(stkId, sent);
+        }
+
+        const ts = Math.floor(Date.now() / 1000);
+        const timeStr = formatearHoraMensaje(ts);
+        const timeRel = formatearHora(ts);
+
+        const newMsgItem = {
+          id: stkId,
+          fromMe: true,
+          sender: myName || "Tú",
+          text: "[Sticker]",
+          tipo: "sticker",
+          time: timeStr,
+          timestamp: ts,
+          status: 2,
+          read: false
+        };
+
+        if (!messagesCache.has(targetChat)) messagesCache.set(targetChat, []);
+        messagesCache.get(targetChat).push(newMsgItem);
+        if (messagesCache.get(targetChat).length > 50) messagesCache.get(targetChat).shift();
+
+        if (chatsCache.has(targetChat)) {
+          const c = chatsCache.get(targetChat);
+          c.lastMsg = "[Sticker]";
+          c.time = timeRel;
+          c.timestamp = ts;
+          c.fromMe = true;
+          c.unread = 0;
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+      } catch (err) {
+        console.error("[Sticker] Error enviando sticker:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
