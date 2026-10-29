@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers, jidNormalizedUser } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
@@ -43,6 +43,45 @@ try {
 }
 
 const rawMediaMap = new Map(); // msgId -> WAMessage
+
+const allMessagesMap = new Map(); // msgId -> raw WAMessage
+const groupMetaCache = new Map(); // jid -> { announce: boolean, soloAdmins: boolean, ts: number }
+
+async function obtenerPermisosGrupo(jid) {
+  if (!jid || !jid.endsWith("@g.us")) return false;
+  const ahora = Date.now();
+  if (groupMetaCache.has(jid)) {
+    const item = groupMetaCache.get(jid);
+    if (ahora - item.ts < 300000) return item.soloAdmins;
+  }
+  if (!sock) return false;
+  try {
+    const meta = await sock.groupMetadata(jid);
+    const soloAdminsConfig = Boolean(meta.announce);
+    if (!soloAdminsConfig) {
+      groupMetaCache.set(jid, { announce: false, soloAdmins: false, ts: ahora });
+      return false;
+    }
+    const myJidNorm = myNumber ? `${myNumber}@s.whatsapp.net` : (sock.user?.id ? jidNormalizedUser(sock.user.id) : "");
+    const myLidNorm = myLid ? jidNormalizedUser(myLid) : "";
+    const soyAdmin = (meta.participants || []).some(p => {
+      if (!p || !p.id) return false;
+      const pJid = jidNormalizedUser(p.id);
+      const pNum = p.id.split("@")[0].split(":")[0];
+      const coincide = (myJidNorm && pJid === myJidNorm) ||
+                       (myLidNorm && pJid === myLidNorm) ||
+                       (myNumber && (pNum === myNumber || pJid.includes(myNumber))) ||
+                       (myLid && p.id.startsWith(myLid.split("@")[0]));
+      return coincide && (p.admin === "admin" || p.admin === "superadmin");
+    });
+    const restringido = soloAdminsConfig && !soyAdmin;
+    groupMetaCache.set(jid, { announce: true, soloAdmins: restringido, ts: ahora });
+    return restringido;
+  } catch (e) {
+    return false;
+  }
+}
+
 
 let sock = null;
 let isConnected = false;
@@ -388,9 +427,13 @@ function procesarMensaje(msg, esEnVivo = true) {
       const k = rawMediaMap.keys().next().value;
       rawMediaMap.delete(k);
     }
-    // Precarga asincrona inmediata de stickers a formato RGB565 One UI
+    // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
     if (innerMsg?.stickerMessage && sharp) {
-      const sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+      let sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+      if (innerMsg.stickerMessage.fileSha256) {
+        sId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
+      }
+      if (sId !== msg.key.id) rawMediaMap.set(sId, msg);
       const rPath = path.join(stickersFolder, `${sId}.raw`);
       if (!fs.existsSync(rPath)) {
         downloadMediaMessage(msg, "buffer", {}, {
@@ -398,6 +441,7 @@ function procesarMensaje(msg, esEnVivo = true) {
           reuploadRequest: sock?.updateMediaMessage
         }).then(buf => {
           if (buf) {
+            try { fs.writeFileSync(path.join(stickersFolder, `${sId}.webp`), buf); } catch (_) {}
             return sharp(buf, { page: 0 })
               .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
               .flatten({ background: { r: 19, g: 27, b: 36 } })
@@ -458,11 +502,15 @@ function procesarMensaje(msg, esEnVivo = true) {
   const isRead = Boolean(mStatus === 4 || mStatus === 5);
   let durSec = 0;
   let tipoMsg = "texto";
+  let msgItemId = msg.key.id;
   if (innerMsg?.audioMessage?.seconds) {
     durSec = Math.round(Number(innerMsg.audioMessage.seconds));
     tipoMsg = "audio";
   } else if (innerMsg?.stickerMessage) {
     tipoMsg = "sticker";
+    if (innerMsg.stickerMessage.fileSha256) {
+      msgItemId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
+    }
   } else if (innerMsg?.imageMessage) {
     tipoMsg = "foto";
   } else if (innerMsg?.videoMessage) {
@@ -470,7 +518,7 @@ function procesarMensaje(msg, esEnVivo = true) {
     durSec = Math.round(Number(innerMsg.videoMessage.seconds) || 0);
   }
   lista.push({
-    id: msg.key.id,
+    id: msgItemId,
     fromMe,
     sender: msg.pushName || (fromMe ? "T\u00fa" : "Contacto"),
     text,
@@ -602,18 +650,17 @@ async function startWhatsApp() {
     }
     if (Array.isArray(messages)) {
       for (const m of messages) {
-        if (m.key?.remoteJid && m.pushName && m.pushName !== myName) {
-          const rj = m.key.remoteJid;
-          pushNameMap.set(rj, m.pushName);
-          const altRj = lidToJid.get(rj) || jidToLid.get(rj);
-          if (altRj) pushNameMap.set(altRj, m.pushName);
+        if (m.key?.id && m.message) {
+          allMessagesMap.set(m.key.id, m.message);
         }
+        procesarMensaje(m, false);
       }
     }
     if (Array.isArray(chats)) {
       for (const c of chats) {
         if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
-        const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
+        const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
+        const nom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null) || c.name || resolverNombre(c.id, "", false);
         const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
         const ts = Number(rawTs);
         if (!chatsCache.has(c.id)) {
@@ -625,9 +672,15 @@ async function startWhatsApp() {
             unread: c.unreadCount || 0,
             timestamp: ts
           });
+        } else {
+          const cur = chatsCache.get(c.id);
+          if (nom && !nom.startsWith("Contacto WA") && (!cur.name || cur.name.startsWith("Contacto WA"))) {
+            cur.name = nom;
+          }
         }
       }
     }
+    programarGuardadoDisco();
     if (Array.isArray(messages)) {
       for (const m of messages) procesarMensaje(m, false);
     }
@@ -1006,6 +1059,9 @@ const server = http.createServer(async (req, res) => {
 
     const list = [];
     for (const c of sorted) {
+      // Excluir stubs vacios de LID que no tienen nombre real ni mensajes
+      const esLidSinMensajes = c.id.endsWith("@lid") && (!c.lastMsg || c.lastMsg === "") && (!c.name || c.name.startsWith("Contacto WA"));
+      if (esLidSinMensajes) continue;
       const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
       const realNom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null);
       if (realNom && !realNom.startsWith("Contacto WA") && !realNom.startsWith("Comunidad #")) {
@@ -1047,6 +1103,7 @@ const server = http.createServer(async (req, res) => {
       // Indicar si es canal
       if (c.id.endsWith("@newsletter")) {
         c.esCanal = true;
+        c.soloAdmins = true;
       }
       // Indicar si es grupo y si solo administradores pueden hablar
       if (c.id.endsWith("@g.us")) {
@@ -1158,7 +1215,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, mensajes: msgs }));
+        let restringido = false;
+    if (chatJid.endsWith("@newsletter")) {
+      restringido = true;
+    } else if (chatJid.endsWith("@g.us")) {
+      restringido = await obtenerPermisosGrupo(chatJid);
+    }
+    return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, soloAdmins: Boolean(restringido), mensajes: msgs }));
   }
 
   // Endpoint de Avatares Nativo One UI: entrega 42x42 RGB565 (3528 bytes) exactos
@@ -1269,6 +1332,7 @@ const server = http.createServer(async (req, res) => {
         reuploadRequest: sock?.updateMediaMessage
       });
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+      try { fs.writeFileSync(path.join(stickersFolder, `${safeId}.webp`), mediaBuf); } catch (_) {}
 
       const resObj = await sharp(mediaBuf, { page: 0 })
         .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
@@ -1494,7 +1558,54 @@ const server = http.createServer(async (req, res) => {
             return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
           }
         }
-        const sent = await sock.sendMessage(chat, { text: texto });
+        let sent;
+        let isStk = false;
+        const stkMatch = (typeof texto === "string") ? texto.match(/^\[Sticker:(.+)\]$/) : null;
+        if (stkMatch) {
+          isStk = true;
+          const stkId = stkMatch[1].replace(/[^a-zA-Z0-9_-]/g, "_");
+          const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+          const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+          if (fs.existsSync(webpPath)) {
+            sent = await sock.sendMessage(chat, { sticker: fs.readFileSync(webpPath) });
+          } else if (rawMediaMap.has(stkId)) {
+            try {
+              const rawMsg = rawMediaMap.get(stkId);
+              const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock?.updateMediaMessage
+              });
+              if (mediaBuf) {
+                try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
+                sent = await sock.sendMessage(chat, { sticker: mediaBuf });
+              }
+            } catch (_) {}
+          }
+          if (!sent && fs.existsSync(rawPath) && sharp) {
+            try {
+              const rawBuf = fs.readFileSync(rawPath);
+              const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+              for (let i = 0; i < 64 * 64; i++) {
+                const c16 = rawBuf.readUInt16LE(i * 2);
+                const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+                const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+                const b = (c16 & 0x1F) * 255 / 31;
+                rgbaBuf[i * 4] = Math.round(r);
+                rgbaBuf[i * 4 + 1] = Math.round(g);
+                rgbaBuf[i * 4 + 2] = Math.round(b);
+                rgbaBuf[i * 4 + 3] = 255;
+              }
+              const webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } }).webp().toBuffer();
+              sent = await sock.sendMessage(chat, { sticker: webpBuf });
+            } catch (_) {}
+          }
+          if (!sent) {
+            sent = await sock.sendMessage(chat, { text: "[Sticker]" });
+          }
+        } else {
+          sent = await sock.sendMessage(chat, { text: texto });
+        }
+        const displayTxt = isStk ? "[Sticker]" : texto;
         if (sent?.key?.id) {
           allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
         }
@@ -1506,7 +1617,7 @@ const server = http.createServer(async (req, res) => {
           id: sent.key.id,
           fromMe: true,
           sender: myName || "Tú",
-          text: texto,
+          text: displayTxt,
           time: timeStr,
           timestamp: ts,
           status: 2,
@@ -1526,7 +1637,7 @@ const server = http.createServer(async (req, res) => {
 
         if (chatsCache.has(chat)) {
           const c = chatsCache.get(chat);
-          c.lastMsg = texto;
+          c.lastMsg = displayTxt;
           c.time = timeRel;
           c.timestamp = ts;
           c.fromMe = true;
@@ -1648,6 +1759,112 @@ const server = http.createServer(async (req, res) => {
         console.error("[Audio] Error:", e);
         res.writeHead(500, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+
+  // API Enviar Sticker Nativo One UI (entrega stream 64x64 RGB565 -> WebP 512x512)
+  if (pathname === "/api/enviar_sticker" && req.method === "POST") {
+    let chat = parsedUrl.query.chat;
+    const stkId = (parsedUrl.query.id || ("stk_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (!chat || !sock) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
+    }
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", async () => {
+      try {
+        const rawBuf = Buffer.concat(chunks);
+        if (rawBuf.length !== 64 * 64 * 2) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sticker invalido: debe ser 64x64 RGB565 (8192 bytes)" }));
+        }
+
+        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
+        const myLidStr = myLid || "75798220378356@lid";
+        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
+                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
+                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
+        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
+
+        // Convertir RGB565 Little-Endian (64x64) a RGBA
+        const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+        for (let i = 0; i < 64 * 64; i++) {
+          const c16 = rawBuf.readUInt16LE(i * 2);
+          const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+          const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+          const b = (c16 & 0x1F) * 255 / 31;
+          rgbaBuf[i * 4] = Math.round(r);
+          rgbaBuf[i * 4 + 1] = Math.round(g);
+          rgbaBuf[i * 4 + 2] = Math.round(b);
+          rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
+        }
+
+        let webpBuf;
+        if (sharp) {
+          webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
+            .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp({ quality: 90 })
+            .toBuffer();
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
+        }
+
+        const sent = await sock.sendMessage(targetChat, {
+          sticker: webpBuf
+        });
+
+        // Guardar en cache del servidor
+        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+        try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {}
+        try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+
+        if (sent?.key?.id) {
+          allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
+          rawMediaMap.set(sent.key.id, sent);
+          rawMediaMap.set(stkId, sent);
+        }
+
+        const ts = Math.floor(Date.now() / 1000);
+        const timeStr = formatearHoraMensaje(ts);
+        const timeRel = formatearHora(ts);
+
+        const newMsgItem = {
+          id: stkId,
+          fromMe: true,
+          sender: myName || "Tú",
+          text: "[Sticker]",
+          tipo: "sticker",
+          time: timeStr,
+          timestamp: ts,
+          status: 2,
+          read: false
+        };
+
+        if (!messagesCache.has(targetChat)) messagesCache.set(targetChat, []);
+        messagesCache.get(targetChat).push(newMsgItem);
+        if (messagesCache.get(targetChat).length > 50) messagesCache.get(targetChat).shift();
+
+        if (chatsCache.has(targetChat)) {
+          const c = chatsCache.get(targetChat);
+          c.lastMsg = "[Sticker]";
+          c.time = timeRel;
+          c.timestamp = ts;
+          c.fromMe = true;
+          c.unread = 0;
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+      } catch (err) {
+        console.error("[Sticker] Error enviando sticker:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: err.message }));
       }
     });
     return;
