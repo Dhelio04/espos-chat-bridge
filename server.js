@@ -401,10 +401,98 @@ function guardarContacto(c) {
   }
 }
 
+// Almacen en memoria de estados recientes de WhatsApp (status@broadcast)
+const estadosMap = new Map(); // id -> item
+
+function procesarEstado(msg, esEnVivo = true) {
+  try {
+    if (!msg || !msg.message) return;
+    const id = msg.key?.id;
+    if (!id) return;
+
+    let innerMsg = msg.message;
+    if (innerMsg?.ephemeralMessage?.message) innerMsg = innerMsg.ephemeralMessage.message;
+    if (innerMsg?.viewOnceMessage?.message) innerMsg = innerMsg.viewOnceMessage.message;
+    if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
+
+    const participant = msg.key?.participant || msg.participant || "";
+    if (!participant) return;
+
+    const alt = lidToJid.get(participant) || jidToLid.get(participant);
+    let autor = contactsMap.get(participant) || (alt ? contactsMap.get(alt) : null) || resolverNombre(participant, "", false);
+    if (!autor || autor === "Desconocido") {
+      autor = participant.split("@")[0];
+      if (autor.length >= 8) autor = "+" + autor;
+    }
+
+    const rawTs = msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000);
+    const ts = Number(rawTs);
+
+    let tipo = "texto";
+    let texto = "";
+    let esFoto = false;
+    let bgArgb = 0xFF128C7E;
+
+    if (innerMsg.imageMessage) {
+      tipo = "foto";
+      esFoto = true;
+      texto = innerMsg.imageMessage.caption ? "[Foto] " + innerMsg.imageMessage.caption : "[Foto]";
+      rawMediaMap.set(id, msg);
+    } else if (innerMsg.videoMessage) {
+      tipo = "video";
+      texto = innerMsg.videoMessage.caption ? "[Video] " + innerMsg.videoMessage.caption : "[Video]";
+    } else if (innerMsg.extendedTextMessage) {
+      tipo = "texto";
+      texto = innerMsg.extendedTextMessage.text || "";
+      if (innerMsg.extendedTextMessage.backgroundArgb) {
+        bgArgb = innerMsg.extendedTextMessage.backgroundArgb;
+      }
+    } else if (innerMsg.conversation) {
+      tipo = "texto";
+      texto = innerMsg.conversation;
+    }
+
+    if (!texto) return;
+
+    const r = (bgArgb >> 16) & 0xFF;
+    const g = (bgArgb >> 8) & 0xFF;
+    const b = bgArgb & 0xFF;
+    const rgb565 = (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+
+    const item = {
+      id: id,
+      autor: autor,
+      participant: participant,
+      tipo: tipo,
+      texto: texto.substring(0, 160),
+      hora: formatearHora(ts),
+      timestamp: ts,
+      esFoto: esFoto ? 1 : 0,
+      bg565: rgb565
+    };
+
+    estadosMap.set(id, item);
+
+    if (estadosMap.size > 50) {
+      const oldestKey = estadosMap.keys().next().value;
+      estadosMap.delete(oldestKey);
+    }
+
+    console.log(`[ESTADO] Capturado estado de ${autor} (${tipo}): ${texto.substring(0, 30)}`);
+  } catch (err) {
+    console.error("[ESTADO] Error procesando estado:", err);
+  }
+}
+
 function procesarMensaje(msg, esEnVivo = true) {
   if (!msg || !msg.message) return;
   let jid = msg.key?.remoteJid;
-  if (!jid || jid.includes("@broadcast") || jid.includes("status@broadcast")) return;
+  if (!jid) return;
+  if (jid === "status@broadcast") {
+    procesarEstado(msg, esEnVivo);
+    return;
+  }
+  if (jid.includes("@broadcast")) return;
 
   // Unificar chat propio: si el mensaje proviene o va a mi LID o a mi numero, normalizarlo siempre a myJid
   const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
@@ -979,6 +1067,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: false, error: e.message }));
     }
+  }
+
+  // API Estados de WhatsApp (Novedades / Historias)
+  if (pathname === "/api/estados" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    const list = Array.from(estadosMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    return res.end(JSON.stringify({ ok: true, total: list.length, estados: list }));
   }
 
   if (pathname === "/api/chats" && req.method === "GET") {
