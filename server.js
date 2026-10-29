@@ -428,7 +428,7 @@ function procesarMensaje(msg, esEnVivo = true) {
       rawMediaMap.delete(k);
     }
     // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
-    if (innerMsg?.stickerMessage && sharp) {
+    if (innerMsg?.stickerMessage && sharp && esEnVivo) {
       let sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
       if (innerMsg.stickerMessage.fileSha256) {
         sId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
@@ -573,7 +573,7 @@ async function startWhatsApp() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
       },
-      browser: Browsers.ubuntu("Chrome"),
+      browser: ["EspOS microPC", "Chrome", "20.0.04"],
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: true,
@@ -611,17 +611,16 @@ async function startWhatsApp() {
         if (connection === "close") {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const isPairingFail = statusCode === 405 || statusCode === 428 || statusCode === 401 || statusCode === DisconnectReason.loggedOut;
-      const shouldReconnect = !isPairingFail;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
       console.log(`[WhatsApp] Conexión cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
-      if (isPairingFail) {
-        console.log("[WhatsApp] Fallo de vinculación o sesión cerrada. Purgando credenciales para nuevo QR limpio...");
+      if (shouldReconnect) {
+        setTimeout(startWhatsApp, 3000);
+      } else {
+        console.log("[WhatsApp] Sesión cerrada formalmente (loggedOut). Purgando credenciales...");
         try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch (e) {}
         rawQR = "";
         currentQR = "";
         setTimeout(startWhatsApp, 2000);
-      } else {
-        setTimeout(startWhatsApp, 3000);
       }
     } else if (connection === "open") {
       isConnected = true;
