@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers, jidNormalizedUser } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
@@ -43,6 +43,45 @@ try {
 }
 
 const rawMediaMap = new Map(); // msgId -> WAMessage
+
+const allMessagesMap = new Map(); // msgId -> raw WAMessage
+const groupMetaCache = new Map(); // jid -> { announce: boolean, soloAdmins: boolean, ts: number }
+
+async function obtenerPermisosGrupo(jid) {
+  if (!jid || !jid.endsWith("@g.us")) return false;
+  const ahora = Date.now();
+  if (groupMetaCache.has(jid)) {
+    const item = groupMetaCache.get(jid);
+    if (ahora - item.ts < 300000) return item.soloAdmins;
+  }
+  if (!sock) return false;
+  try {
+    const meta = await sock.groupMetadata(jid);
+    const soloAdminsConfig = Boolean(meta.announce);
+    if (!soloAdminsConfig) {
+      groupMetaCache.set(jid, { announce: false, soloAdmins: false, ts: ahora });
+      return false;
+    }
+    const myJidNorm = myNumber ? `${myNumber}@s.whatsapp.net` : (sock.user?.id ? jidNormalizedUser(sock.user.id) : "");
+    const myLidNorm = myLid ? jidNormalizedUser(myLid) : "";
+    const soyAdmin = (meta.participants || []).some(p => {
+      if (!p || !p.id) return false;
+      const pJid = jidNormalizedUser(p.id);
+      const pNum = p.id.split("@")[0].split(":")[0];
+      const coincide = (myJidNorm && pJid === myJidNorm) ||
+                       (myLidNorm && pJid === myLidNorm) ||
+                       (myNumber && (pNum === myNumber || pJid.includes(myNumber))) ||
+                       (myLid && p.id.startsWith(myLid.split("@")[0]));
+      return coincide && (p.admin === "admin" || p.admin === "superadmin");
+    });
+    const restringido = soloAdminsConfig && !soyAdmin;
+    groupMetaCache.set(jid, { announce: true, soloAdmins: restringido, ts: ahora });
+    return restringido;
+  } catch (e) {
+    return false;
+  }
+}
+
 
 let sock = null;
 let isConnected = false;
@@ -611,18 +650,17 @@ async function startWhatsApp() {
     }
     if (Array.isArray(messages)) {
       for (const m of messages) {
-        if (m.key?.remoteJid && m.pushName && m.pushName !== myName) {
-          const rj = m.key.remoteJid;
-          pushNameMap.set(rj, m.pushName);
-          const altRj = lidToJid.get(rj) || jidToLid.get(rj);
-          if (altRj) pushNameMap.set(altRj, m.pushName);
+        if (m.key?.id && m.message) {
+          allMessagesMap.set(m.key.id, m.message);
         }
+        procesarMensaje(m, false);
       }
     }
     if (Array.isArray(chats)) {
       for (const c of chats) {
         if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
-        const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
+        const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
+        const nom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null) || c.name || resolverNombre(c.id, "", false);
         const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
         const ts = Number(rawTs);
         if (!chatsCache.has(c.id)) {
@@ -634,9 +672,15 @@ async function startWhatsApp() {
             unread: c.unreadCount || 0,
             timestamp: ts
           });
+        } else {
+          const cur = chatsCache.get(c.id);
+          if (nom && !nom.startsWith("Contacto WA") && (!cur.name || cur.name.startsWith("Contacto WA"))) {
+            cur.name = nom;
+          }
         }
       }
     }
+    programarGuardadoDisco();
     if (Array.isArray(messages)) {
       for (const m of messages) procesarMensaje(m, false);
     }
@@ -1015,6 +1059,9 @@ const server = http.createServer(async (req, res) => {
 
     const list = [];
     for (const c of sorted) {
+      // Excluir stubs vacios de LID que no tienen nombre real ni mensajes
+      const esLidSinMensajes = c.id.endsWith("@lid") && (!c.lastMsg || c.lastMsg === "") && (!c.name || c.name.startsWith("Contacto WA"));
+      if (esLidSinMensajes) continue;
       const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
       const realNom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null);
       if (realNom && !realNom.startsWith("Contacto WA") && !realNom.startsWith("Comunidad #")) {
