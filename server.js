@@ -724,13 +724,28 @@ async function startWhatsApp() {
         if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
         if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
       }
+      // Purgar avatar en disco si el contacto se actualizo para descargar la foto mas reciente
+      if (c && c.id) {
+        const safeId = c.id.replace(/[^a-zA-Z0-9]/g, "_");
+        try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
+        if (c.lid) {
+          const safeLid = c.lid.replace(/[^a-zA-Z0-9]/g, "_");
+          try { if (fs.existsSync(path.join(avatarsFolder, `${safeLid}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeLid}.raw`)); } catch (_) {}
+        }
+      }
     }
   };
   sock.ev.on("contacts.upsert", onContacts);
   sock.ev.on("contacts.update", onContacts);
 
     sock.ev.on("groups.update", async (updates) => {
-    for (const u of updates) { if (u?.id) groupMetaCache.delete(u.id); }
+    for (const u of updates) {
+      if (u?.id) {
+        groupMetaCache.delete(u.id);
+        const safeId = u.id.replace(/[^a-zA-Z0-9]/g, "_");
+        try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
+      }
+    }
   });
   sock.ev.on("group-participants.update", async (update) => {
     if (update?.id) groupMetaCache.delete(update.id);
@@ -1226,6 +1241,7 @@ const server = http.createServer(async (req, res) => {
   // Endpoint de Avatares Nativo One UI: entrega 42x42 RGB565 (3528 bytes) exactos
   if (pathname === "/api/avatar" && req.method === "GET") {
     const chatJid = parsedUrl.query.chat;
+    const forzar = parsedUrl.query.force === "1";
     if (!chatJid || !sock) {
       res.writeHead(400); return res.end();
     }
@@ -1233,17 +1249,23 @@ const server = http.createServer(async (req, res) => {
       const safeId = chatJid.replace(/[^a-zA-Z0-9]/g, "_");
       const rawPath = path.join(avatarsFolder, `${safeId}.raw`);
       
-      // 1. Si ya esta en cache de disco del servidor, servirlo de inmediato
-      if (fs.existsSync(rawPath)) {
-        const rawBuf = fs.readFileSync(rawPath);
-        if (rawBuf.length === 42 * 42 * 2) {
-          res.writeHead(200, {
-            "Content-Type": "application/octet-stream",
-            "Content-Length": rawBuf.length,
-            "Cache-Control": "public, max-age=604800"
-          });
-          return res.end(rawBuf);
-        }
+      // 1. Si ya esta en cache de disco del servidor y no esta forzado ni expirado (TTL 12h), servirlo
+      if (!forzar && fs.existsSync(rawPath)) {
+        try {
+          const st = fs.statSync(rawPath);
+          const edadMs = Date.now() - st.mtimeMs;
+          if (edadMs < 12 * 3600 * 1000) {
+            const rawBuf = fs.readFileSync(rawPath);
+            if (rawBuf.length === 42 * 42 * 2) {
+              res.writeHead(200, {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": rawBuf.length,
+                "Cache-Control": "public, max-age=43200"
+              });
+              return res.end(rawBuf);
+            }
+          }
+        } catch (_) {}
       }
 
       // 2. Pedir URL del avatar a WhatsApp con proteccion de timeout de 2.5s
@@ -1257,6 +1279,8 @@ const server = http.createServer(async (req, res) => {
         if (alt) ppUrl = await withTimeout(sock.profilePictureUrl(alt, "image"), 2500).catch(() => null);
       }
       if (!ppUrl) {
+        // Si no tiene foto o la quito, borrar foto antigua de disco para ahorrar espacio
+        try { if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath); } catch (_) {}
         res.writeHead(404); return res.end();
       }
 
@@ -1285,26 +1309,25 @@ const server = http.createServer(async (req, res) => {
           rgb565Buf.writeUInt16LE(c565, i * 2);
         }
 
+        // Borrar el archivo viejo si existia antes de escribir el nuevo para garantizar espacio limpio
+        try { if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath); } catch (_) {}
         fs.writeFileSync(rawPath, rgb565Buf);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
           "Content-Length": rgb565Buf.length,
-          "Cache-Control": "public, max-age=604800"
+          "Cache-Control": "public, max-age=43200"
         });
         return res.end(rgb565Buf);
       }
 
-      // Fallback si no hay sharp
       res.writeHead(200, { "Content-Type": "image/jpeg" });
       return res.end(imgBuffer);
     } catch (e) {
       console.log(`[Avatar] Error al procesar ${chatJid}:`, e.message);
-      res.writeHead(404);
-      return res.end();
+      res.writeHead(500); return res.end();
     }
   }
 
-  // Endpoint de Stickers Nativo One UI: entrega 64x64 RGB565 (8192 bytes) Little-Endian
   if (pathname === "/api/sticker" && req.method === "GET") {
     const msgId = parsedUrl.query.id;
     if (!msgId) { res.writeHead(400); return res.end(); }
@@ -1599,7 +1622,8 @@ const server = http.createServer(async (req, res) => {
             } catch (_) {}
           }
           if (!sent) {
-            sent = await sock.sendMessage(chat, { text: "[Sticker]" });
+            res.writeHead(404, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: false, error: "Sticker no disponible en servidor" }));
           }
         } else {
           sent = await sock.sendMessage(chat, { text: texto });
@@ -1777,9 +1801,51 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const rawBuf = Buffer.concat(chunks);
-        if (rawBuf.length !== 64 * 64 * 2) {
+        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+        let webpBuf = null;
+
+        if (rawBuf.length === 64 * 64 * 2) {
+          // Convertir RGB565 Little-Endian (64x64) a RGBA
+          const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+          for (let i = 0; i < 64 * 64; i++) {
+            const c16 = rawBuf.readUInt16LE(i * 2);
+            const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+            const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+            const b = (c16 & 0x1F) * 255 / 31;
+            rgbaBuf[i * 4] = Math.round(r);
+            rgbaBuf[i * 4 + 1] = Math.round(g);
+            rgbaBuf[i * 4 + 2] = Math.round(b);
+            rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
+          }
+
+          if (sharp) {
+            webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
+              .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+              .webp({ quality: 90 })
+              .toBuffer();
+          } else {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
+          }
+          try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+          if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
+        } else if (fs.existsSync(webpPath)) {
+          webpBuf = fs.readFileSync(webpPath);
+        } else if (rawMediaMap.has(stkId)) {
+          try {
+            const rawMsg = rawMediaMap.get(stkId);
+            webpBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+              logger: pino({ level: "silent" }),
+              reuploadRequest: sock?.updateMediaMessage
+            });
+            if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
+          } catch (_) {}
+        }
+
+        if (!webpBuf) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "Sticker invalido: debe ser 64x64 RGB565 (8192 bytes)" }));
+          return res.end(JSON.stringify({ error: "Sticker invalido: debe enviar 8192 bytes o id existente" }));
         }
 
         const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
@@ -1789,39 +1855,9 @@ const server = http.createServer(async (req, res) => {
                         (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
         const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
 
-        // Convertir RGB565 Little-Endian (64x64) a RGBA
-        const rgbaBuf = Buffer.alloc(64 * 64 * 4);
-        for (let i = 0; i < 64 * 64; i++) {
-          const c16 = rawBuf.readUInt16LE(i * 2);
-          const r = ((c16 >> 11) & 0x1F) * 255 / 31;
-          const g = ((c16 >> 5) & 0x3F) * 255 / 63;
-          const b = (c16 & 0x1F) * 255 / 31;
-          rgbaBuf[i * 4] = Math.round(r);
-          rgbaBuf[i * 4 + 1] = Math.round(g);
-          rgbaBuf[i * 4 + 2] = Math.round(b);
-          rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
-        }
-
-        let webpBuf;
-        if (sharp) {
-          webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
-            .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-            .webp({ quality: 90 })
-            .toBuffer();
-        } else {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
-        }
-
         const sent = await sock.sendMessage(targetChat, {
           sticker: webpBuf
         });
-
-        // Guardar en cache del servidor
-        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
-        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
-        try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {}
-        try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
 
         if (sent?.key?.id) {
           allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
