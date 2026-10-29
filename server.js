@@ -1056,6 +1056,7 @@ const server = http.createServer(async (req, res) => {
       // Indicar si es canal
       if (c.id.endsWith("@newsletter")) {
         c.esCanal = true;
+        c.soloAdmins = true;
       }
       // Indicar si es grupo y si solo administradores pueden hablar
       if (c.id.endsWith("@g.us")) {
@@ -1167,7 +1168,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, mensajes: msgs }));
+        let restringido = false;
+    if (chatJid.endsWith("@newsletter")) {
+      restringido = true;
+    } else if (chatJid.endsWith("@g.us")) {
+      restringido = await obtenerPermisosGrupo(chatJid);
+    }
+    return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, soloAdmins: Boolean(restringido), mensajes: msgs }));
   }
 
   // Endpoint de Avatares Nativo One UI: entrega 42x42 RGB565 (3528 bytes) exactos
