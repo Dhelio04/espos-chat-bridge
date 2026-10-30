@@ -440,7 +440,9 @@ function procesarEstado(msg, esEnVivo = true) {
       rawMediaMap.set(id, msg);
     } else if (innerMsg.videoMessage) {
       tipo = "video";
-      texto = innerMsg.videoMessage.caption ? "[Video] " + innerMsg.videoMessage.caption : "[Video]";
+      esFoto = true;
+      texto = innerMsg.videoMessage.caption ? "[Foto] " + innerMsg.videoMessage.caption : "[Foto con musica]";
+      rawMediaMap.set(id, msg);
     } else if (innerMsg.extendedTextMessage) {
       tipo = "texto";
       texto = innerMsg.extendedTextMessage.text || "";
@@ -1024,7 +1026,7 @@ const server = http.createServer(async (req, res) => {
     const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      version: "2.9.5",
+      version: "3.2.0",
       uptime: Math.round(process.uptime()),
       connected: isConnected,
       myNumber,
@@ -1533,11 +1535,21 @@ const server = http.createServer(async (req, res) => {
       let mediaBuf = null;
       if (inner?.videoMessage?.jpegThumbnail) {
         mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
+      } else if (inner?.imageMessage?.jpegThumbnail && !sock) {
+        mediaBuf = Buffer.from(inner.imageMessage.jpegThumbnail);
       } else {
-        mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-          logger: pino({ level: "silent" }),
-          reuploadRequest: sock?.updateMediaMessage
-        });
+        try {
+          mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+            logger: pino({ level: "silent" }),
+            reuploadRequest: sock?.updateMediaMessage
+          });
+        } catch (e) {
+          if (inner?.videoMessage?.jpegThumbnail) {
+            mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
+          } else if (inner?.imageMessage?.jpegThumbnail) {
+            mediaBuf = Buffer.from(inner.imageMessage.jpegThumbnail);
+          }
+        }
       }
 
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
