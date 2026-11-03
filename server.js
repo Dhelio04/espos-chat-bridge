@@ -700,7 +700,7 @@ async function startWhatsApp() {
       browser: ["EspOS microPC", "Chrome", "20.0.04"],
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       getMessage: async (key) => {
         if (!key?.id) return undefined;
         // 1. Buscar en el mapa rapido de mensajes completos (por ID)
@@ -764,6 +764,12 @@ async function startWhatsApp() {
       }
       console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
       sincronizarGruposReales();
+      try {
+        await sock.sendPresenceUpdate('unavailable');
+        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') para no figurar en línea 24/7.");
+      } catch (pe) {
+        console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
+      }
     }
   });
 
