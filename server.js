@@ -126,12 +126,18 @@ function cargarStoreDisco() {
         for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
       }
       if (data.messages) {
-        const ahoraSeg = Math.floor(Date.now() / 1000);
         for (const [k, v] of Object.entries(data.messages)) {
           if (Array.isArray(v)) {
-            // Solo restaurar mensajes recientes de las ultimas 24 horas para evitar revivir historiales obsoletos
-            const recientes = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
+            const recientes = v.slice(-50);
             if (recientes.length > 0) messagesCache.set(k, recientes);
+          }
+        }
+      }
+      if (data.estados) {
+        const ahoraSeg = Math.floor(Date.now() / 1000);
+        for (const [k, v] of Object.entries(data.estados)) {
+          if (ahoraSeg - (Number(v.timestamp) || 0) < 86400) {
+            estadosMap.set(k, v);
           }
         }
       }
@@ -182,8 +188,14 @@ function programarGuardadoDisco() {
       const msgsFrescos = {};
       for (const [k, v] of messagesCache.entries()) {
         if (Array.isArray(v)) {
-          const filtrados = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
-          if (filtrados.length > 0) msgsFrescos[k] = filtrados;
+          const ultimos = v.slice(-50);
+          if (ultimos.length > 0) msgsFrescos[k] = ultimos;
+        }
+      }
+      const estadosValidos = {};
+      for (const [k, v] of estadosMap.entries()) {
+        if (ahoraSeg - (Number(v.timestamp) || 0) < 86400) {
+          estadosValidos[k] = v;
         }
       }
       const payload = {
@@ -194,6 +206,7 @@ function programarGuardadoDisco() {
         jidToLid: Object.fromEntries(jidToLid.entries()),
         chats: Object.fromEntries(chatsCache.entries()),
         messages: msgsFrescos,
+        estados: estadosValidos,
         rawMedia: Object.fromEntries(Array.from(rawMediaMap.entries()).slice(-100))
       };
       fs.writeFileSync(storeFile, JSON.stringify(payload));
@@ -415,14 +428,18 @@ function procesarEstado(msg, esEnVivo = true) {
     if (innerMsg?.viewOnceMessage?.message) innerMsg = innerMsg.viewOnceMessage.message;
     if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
 
-    const participant = msg.key?.participant || msg.participant || "";
+    let participant = msg.key?.participant || msg.participant || "";
+    const esPropio = Boolean(msg.key?.fromMe);
+    if (!participant && esPropio) {
+      participant = sock?.user?.id ? jidNormalizedUser(sock.user.id) : (myNumber ? `${myNumber}@s.whatsapp.net` : "me");
+    }
     if (!participant) return;
 
     const alt = lidToJid.get(participant) || jidToLid.get(participant);
-    let autor = contactsMap.get(participant) || (alt ? contactsMap.get(alt) : null) || resolverNombre(participant, "", false);
+    let autor = esPropio ? "Tú" : (contactsMap.get(participant) || (alt ? contactsMap.get(alt) : null) || resolverNombre(participant, "", false));
     if (!autor || autor === "Desconocido") {
-      autor = participant.split("@")[0];
-      if (autor.length >= 8) autor = "+" + autor;
+      autor = esPropio ? "Tú" : participant.split("@")[0];
+      if (autor.length >= 8 && !esPropio) autor = "+" + autor;
     }
 
     const rawTs = msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000);
@@ -433,16 +450,33 @@ function procesarEstado(msg, esEnVivo = true) {
     let esFoto = false;
     let bgArgb = 0xFF128C7E;
 
+    const safeId = id.replace(/[^a-zA-Z0-9_-]/g, "_");
     if (innerMsg.imageMessage) {
       tipo = "foto";
       esFoto = true;
       texto = innerMsg.imageMessage.caption ? "[Foto] " + innerMsg.imageMessage.caption : "[Foto]";
       rawMediaMap.set(id, msg);
+      if (innerMsg.imageMessage.jpegThumbnail) {
+        try {
+          const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
+          if (!fs.existsSync(jpgPath)) {
+            fs.writeFileSync(jpgPath, Buffer.from(innerMsg.imageMessage.jpegThumbnail));
+          }
+        } catch (_) {}
+      }
     } else if (innerMsg.videoMessage) {
       tipo = "video";
       esFoto = true;
       texto = innerMsg.videoMessage.caption ? "[Foto] " + innerMsg.videoMessage.caption : "[Foto con musica]";
       rawMediaMap.set(id, msg);
+      if (innerMsg.videoMessage.jpegThumbnail) {
+        try {
+          const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
+          if (!fs.existsSync(jpgPath)) {
+            fs.writeFileSync(jpgPath, Buffer.from(innerMsg.videoMessage.jpegThumbnail));
+          }
+        } catch (_) {}
+      }
     } else if (innerMsg.extendedTextMessage) {
       tipo = "texto";
       texto = innerMsg.extendedTextMessage.text || "";
@@ -666,7 +700,7 @@ async function startWhatsApp() {
       browser: ["EspOS microPC", "Chrome", "20.0.04"],
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       getMessage: async (key) => {
         if (!key?.id) return undefined;
         // 1. Buscar en el mapa rapido de mensajes completos (por ID)
@@ -730,6 +764,12 @@ async function startWhatsApp() {
       }
       console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
       sincronizarGruposReales();
+      try {
+        await sock.sendPresenceUpdate('unavailable');
+        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') para no figurar en línea 24/7.");
+      } catch (pe) {
+        console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
+      }
     }
   });
 
@@ -1026,7 +1066,7 @@ const server = http.createServer(async (req, res) => {
     const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      version: "3.2.0",
+      version: "3.3.0",
       uptime: Math.round(process.uptime()),
       connected: isConnected,
       myNumber,
@@ -1522,8 +1562,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      let mediaBuf = null;
+      if (fs.existsSync(jpgPath)) {
+        try { mediaBuf = fs.readFileSync(jpgPath); } catch (_) {}
+      }
       const rawMsg = rawMediaMap.get(msgId);
-      if (!rawMsg) { res.writeHead(404); return res.end("Foto no en memoria"); }
+      if (!mediaBuf && !rawMsg) { res.writeHead(404); return res.end("Foto no en memoria ni en disco"); }
       if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
 
       let inner = rawMsg.message;
@@ -1532,8 +1576,7 @@ const server = http.createServer(async (req, res) => {
       if (inner?.viewOnceMessageV2?.message) inner = inner.viewOnceMessageV2.message;
       if (inner?.documentWithCaptionMessage?.message) inner = inner.documentWithCaptionMessage.message;
 
-      let mediaBuf = null;
-      if (inner?.videoMessage?.jpegThumbnail) {
+      if (!mediaBuf && inner?.videoMessage?.jpegThumbnail) {
         mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
       } else if (inner?.imageMessage?.jpegThumbnail && !sock) {
         mediaBuf = Buffer.from(inner.imageMessage.jpegThumbnail);
