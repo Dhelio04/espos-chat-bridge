@@ -701,6 +701,8 @@ async function startWhatsApp() {
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: false,
+      connectTimeoutMs: 30000,
+      keepAliveIntervalMs: 15000,
       getMessage: async (key) => {
         if (!key?.id) return undefined;
         // 1. Buscar en el mapa rapido de mensajes completos (por ID)
@@ -742,8 +744,14 @@ async function startWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      rawQR = qr;
-      currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
+      const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
+      if (!estaVinculado) {
+        rawQR = qr;
+        currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
+      } else {
+        rawQR = "";
+        currentQR = "";
+      }
       isConnected = false;
     }
 
@@ -764,6 +772,7 @@ async function startWhatsApp() {
     } else if (connection === "open") {
       isConnected = true;
       currentQR = "";
+      rawQR = "";
       myNumber = sock.user.id.split(":")[0];
       myName = sock.user.name || "Gab";
       if (sock.user.lid) {
@@ -1043,13 +1052,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/api/status" && req.method === "GET") {
+    const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       conectado: isConnected,
+      vinculado: estaVinculado,
+      estado: isConnected ? "conectado" : (estaVinculado ? "reconectando" : "esperando_qr"),
       usuario: myName,
       numero: myNumber,
       totalChats: chatsCache.size,
-      qr: isConnected ? "" : (rawQR || "")
+      qr: (isConnected || estaVinculado) ? "" : (rawQR || "")
     }));
   }
 
@@ -1105,7 +1117,7 @@ const server = http.createServer(async (req, res) => {
     const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      version: "3.3.1",
+      version: "3.3.2",
       uptime: Math.round(process.uptime()),
       connected: isConnected,
       myNumber,
@@ -1309,13 +1321,16 @@ const server = http.createServer(async (req, res) => {
       if (list.length >= 50) break;
     }
 
+    const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       conectado: isConnected,
+      vinculado: estaVinculado,
+      estado: isConnected ? "conectado" : (estaVinculado ? "reconectando" : "esperando_qr"),
       usuario: myName,
       numero: myNumber,
       totalChats: chatsCache.size,
-      qr: isConnected ? "" : (rawQR || ""),
+      qr: (isConnected || estaVinculado) ? "" : (rawQR || ""),
       chats: list,
       llamadas: callsList
     }));
