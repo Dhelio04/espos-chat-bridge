@@ -721,6 +721,21 @@ async function startWhatsApp() {
       }
     });
 
+    // ESCUDO TOTAL CONTRA FUGAS DE PRESENCIA EN LINEA (Baileys PushName Bug Fix)
+  // Baileys emite un nodo <presence attrs={{ name }} /> sin atributo 'type' en cada evento creds.update (socket.js:564).
+  // WhatsApp interpreta cualquier presencia sin type o con type='available' como 'En linea' (Online 24/7).
+  // Interceptamos sock.sendNode para bloquear cualquier presencia no autorizada:
+  const rawSendNode = sock.sendNode.bind(sock);
+  sock.sendNode = async (node) => {
+    if (node && node.tag === 'presence') {
+      const pType = node.attrs?.type;
+      if (!pType || pType === 'available') {
+        return; // Descartar silenciosamente fugas de presencia online
+      }
+    }
+    return rawSendNode(node);
+  };
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
@@ -732,7 +747,7 @@ async function startWhatsApp() {
       isConnected = false;
     }
 
-        if (connection === "close") {
+    if (connection === "close") {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
@@ -765,13 +780,37 @@ async function startWhatsApp() {
       console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
       sincronizarGruposReales();
       try {
-        await sock.sendPresenceUpdate('unavailable');
-        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') para no figurar en línea 24/7.");
+        const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
+        await rawSendNode({
+          tag: 'presence',
+          attrs: {
+            name: meName,
+            type: 'unavailable'
+          }
+        });
+        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') forzada con exito.");
       } catch (pe) {
         console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
       }
     }
   });
+
+  if (!global.__presenceWatchdog) {
+    global.__presenceWatchdog = setInterval(async () => {
+      try {
+        if (sock && isConnected) {
+          const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
+          await rawSendNode({
+            tag: 'presence',
+            attrs: {
+              name: meName,
+              type: 'unavailable'
+            }
+          });
+        }
+      } catch (_) {}
+    }, 5 * 60 * 1000);
+  }
 
   sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
     if (Array.isArray(contacts)) {
@@ -1066,7 +1105,7 @@ const server = http.createServer(async (req, res) => {
     const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      version: "3.3.0",
+      version: "3.3.1",
       uptime: Math.round(process.uptime()),
       connected: isConnected,
       myNumber,
