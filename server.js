@@ -1,13 +1,14 @@
 /**
- * EspOS EspCHAT Cloud Bridge v2.8.2 - Real Sync, LastSeen Lima, Stickers & Audio WAV Engine - Sync chatsCache with messagesCache, Real lastMsg & Timestamps ("En línea", "Escribiendo...", "Grabando...", "últ. vez") & Zero Phone Leaks
- * - Sincronizacion en tiempo real con chats.upsert, chats.update y messaging-history.
- * - Desduplicacion inteligente de LIDs y telefonos (@lid <-> @s.whatsapp.net).
- * - Fechas relativas oficiales de WhatsApp (Hoy: 1:33 p.m., Ayer, Dia de semana, Fecha).
- * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
- * - Escudo Anti-Delete persistente.
+ * EspOS EspCHAT Cloud/LAN Bridge v3.4.0 - Hardened Security, Anti-OOM, Zero Hardcoded PII & Contract Unification
+ * - Autenticacion obligatoria Fail-Closed via header X-EspOS-Key + Rate Limiter anti-fuerza bruta.
+ * - Limites estrictos de payload en streaming (leerBodySeguro) contra OOM/DoS (HTTP 413).
+ * - Endpoints destructivos convertidos a POST autenticado con confirmacion explicita ({ confirm: true }).
+ * - Cero PII hardcodeada, /api/diag saneado, / minimalista sin fugas de sesion ni CORS *.
+ * - Sincronizacion en tiempo real, avatares/stickers RGB565 One UI, notas de voz WAV 16kHz y Anti-Delete.
  */
 const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers, jidNormalizedUser } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
+const crypto = require("crypto");
 const pino = require("pino");
 const http = require("http");
 const url = require("url");
@@ -19,17 +20,200 @@ let sharp = null;
 try { sharp = require("sharp"); console.log("[Sharp] Motor de imagenes cargado correctamente"); } catch (e) { console.log("[Sharp] No disponible aun"); }
 
 const PORT = process.env.PORT || 3000;
-const authFolder = path.join(__dirname, "auth_info_baileys");
-const avatarsFolder = path.join(__dirname, "avatars_cache");
-const stickersFolder = path.join(__dirname, "stickers_cache");
-const photosFolder   = path.join(__dirname, "photos_cache");
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const SKIP_WA = process.env.ESPOS_SKIP_WA === "1";
+const IS_CLOUD = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || process.env.NODE_ENV === "production");
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const authFolder = path.join(DATA_DIR, "auth_info_baileys");
+const avatarsFolder = path.join(DATA_DIR, "avatars_cache");
+const stickersFolder = path.join(DATA_DIR, "stickers_cache");
+const photosFolder = path.join(DATA_DIR, "photos_cache");
+const audioFolder = path.join(DATA_DIR, "audio_cache");
+const storeFile = path.join(DATA_DIR, "espos_store.json");
+
 if (!fs.existsSync(photosFolder)) fs.mkdirSync(photosFolder, { recursive: true });
-const audioFolder = path.join(__dirname, "audio_cache");
 if (!fs.existsSync(avatarsFolder)) fs.mkdirSync(avatarsFolder, { recursive: true });
 if (!fs.existsSync(stickersFolder)) fs.mkdirSync(stickersFolder, { recursive: true });
 if (!fs.existsSync(audioFolder)) fs.mkdirSync(audioFolder, { recursive: true });
 
-// Purgar cache de stickers antiguos generados con stride incorrecto (v2.8.2)
+// Carga Fail-Closed de ESPOS_API_KEY
+function cargarApiKey() {
+  const fromEnv = process.env.ESPOS_API_KEY ? process.env.ESPOS_API_KEY.trim() : "";
+  if (fromEnv) return fromEnv;
+
+  if (IS_CLOUD) {
+    console.error("[Auth] ERROR CRITICO: ESPOS_API_KEY no configurada en entorno cloud. Modo Fail-Closed activo (HTTP 503 en /api/*).");
+    return "";
+  }
+
+  // Entorno local: buscar en .env junto al script o en DATA_DIR/.espos_key
+  const envFile = path.join(__dirname, ".env");
+  try {
+    if (fs.existsSync(envFile)) {
+      const lines = fs.readFileSync(envFile, "utf8").split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const m = trimmed.match(/^ESPOS_API_KEY\s*=\s*(.+)$/);
+        if (m) {
+          let val = m[1].trim();
+          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1).trim();
+          }
+          if (val) return val;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[Auth] No se pudo leer .env local:", e.message);
+  }
+
+  const keyFile = path.join(DATA_DIR, ".espos_key");
+  try {
+    if (fs.existsSync(keyFile)) {
+      const existing = fs.readFileSync(keyFile, "utf8").trim();
+      if (existing) return existing;
+    }
+  } catch (e) {
+    console.warn("[Auth] No se pudo leer .espos_key:", e.message);
+  }
+
+  const generated = crypto.randomBytes(32).toString("hex");
+  try {
+    fs.writeFileSync(keyFile, generated + "\n", { mode: 0o600 });
+    console.log(`[Auth] Clave local generada en ${keyFile} (fingerprint: ${generated.slice(0, 8)}...)`);
+  } catch (e) {
+    console.error("[Auth] Error escribiendo .espos_key:", e.message);
+  }
+  return generated;
+}
+
+const API_KEY = cargarApiKey();
+const EXPECTED_KEY_HASH = API_KEY ? crypto.createHash("sha256").update(API_KEY, "utf8").digest() : null;
+
+function verificarApiKey(req) {
+  if (!EXPECTED_KEY_HASH) return false;
+  const provided = req.headers["x-espos-key"];
+  if (typeof provided !== "string" || !provided) return false;
+  const providedHash = crypto.createHash("sha256").update(provided, "utf8").digest();
+  if (providedHash.length !== EXPECTED_KEY_HASH.length) return false;
+  return crypto.timingSafeEqual(providedHash, EXPECTED_KEY_HASH);
+}
+
+// Rate limiter anti-fuerza bruta por IP (10 fallos en 15 min -> bloqueo 15 min)
+const MAX_AUTH_FAILS = 10;
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_BLOCK_MS = 15 * 60 * 1000;
+const failedAuthByIp = new Map(); // ip -> { count, firstFailAt, blockedUntil }
+
+function obtenerIpCliente(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.trim()) {
+    return xff.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function estaBloqueadaIp(ip) {
+  const entry = failedAuthByIp.get(ip);
+  if (!entry) return false;
+  const now = Date.now();
+  if (entry.blockedUntil) {
+    if (now < entry.blockedUntil) return true;
+    failedAuthByIp.delete(ip);
+    return false;
+  }
+  if (now - entry.firstFailAt > AUTH_WINDOW_MS) {
+    failedAuthByIp.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function registrarFalloAuth(ip) {
+  const now = Date.now();
+  let entry = failedAuthByIp.get(ip);
+  if (!entry || (now - entry.firstFailAt > AUTH_WINDOW_MS && !entry.blockedUntil)) {
+    entry = { count: 1, firstFailAt: now, blockedUntil: 0 };
+    failedAuthByIp.set(ip, entry);
+    return;
+  }
+  entry.count += 1;
+  if (entry.count >= MAX_AUTH_FAILS) {
+    entry.blockedUntil = now + AUTH_BLOCK_MS;
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of failedAuthByIp.entries()) {
+    if (entry.blockedUntil && now >= entry.blockedUntil) {
+      failedAuthByIp.delete(ip);
+    } else if (!entry.blockedUntil && now - entry.firstFailAt > AUTH_WINDOW_MS) {
+      failedAuthByIp.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function leerBodySeguro(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const contentLength = parseInt(req.headers["content-length"] || "0", 10);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      const err = new Error("Payload Too Large");
+      err.statusCode = 413;
+      req.pause();
+      return reject(err);
+    }
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    req.on("data", (chunk) => {
+      if (settled) return;
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        settled = true;
+        const err = new Error("Payload Too Large");
+        err.statusCode = 413;
+        req.pause();
+        return reject(err);
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
+function responderErrorBody(res, req, err) {
+  if (err && err.statusCode === 413) {
+    res.writeHead(413, { "Content-Type": "application/json", "Connection": "close" });
+    return res.end(JSON.stringify({ ok: false, error: "Payload Too Large" }), () => {
+      try { req.destroy(); } catch (_) {}
+    });
+  }
+  res.writeHead(400, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ ok: false, error: err?.message || "Solicitud invalida" }));
+}
+
+// Purgar cache de stickers antiguos generados con stride incorrecto
 try {
   if (fs.existsSync(stickersFolder)) {
     const sFiles = fs.readdirSync(stickersFolder);
@@ -39,13 +223,58 @@ try {
     console.log(`[Stickers] Cache purgado al iniciar (${sFiles.length} stickers limpiados)`);
   }
 } catch (e) {
-  console.warn('[Stickers] Error purgando cache:', e.message);
+  console.warn("[Stickers] Error purgando cache:", e.message);
 }
 
 const rawMediaMap = new Map(); // msgId -> WAMessage
-
 const allMessagesMap = new Map(); // msgId -> raw WAMessage
 const groupMetaCache = new Map(); // jid -> { announce: boolean, soloAdmins: boolean, ts: number }
+const estadosMap = new Map(); // id -> item (declarado antes de cargarStoreDisco para evitar TDZ)
+
+let sock = null;
+let isConnected = false;
+let myNumber = "";
+let myName = "";
+let myLid = "";
+let currentQR = "";
+let rawQR = "";
+let chatsCache = new Map();
+let messagesCache = new Map();
+let agendaMap = new Map();   // JID / LID -> Nombre guardado por el usuario en su agenda
+let pushNameMap = new Map(); // JID / LID -> Apodo que el contacto se puso a si mismo
+let contactsMap = agendaMap; // Alias de compatibilidad
+let lidToJid = new Map();    // LID -> JID
+let jidToLid = new Map();    // JID -> LID
+let presenceMap = new Map();  // JID -> { status: "available"|"composing"|..., t: number }
+let callsList = [];
+
+function obtenerMiJid() {
+  if (myNumber) return `${myNumber}@s.whatsapp.net`;
+  if (sock?.user?.id) return jidNormalizedUser(sock.user.id);
+  return "";
+}
+
+function esChatPropio(jid) {
+  if (!jid || typeof jid !== "string") return false;
+  if (jid.endsWith("@g.us") || jid.endsWith("@newsletter")) return false;
+  const norm = jidNormalizedUser(jid);
+  const myJid = obtenerMiJid();
+  const sockNum = sock?.user?.id ? jidNormalizedUser(sock.user.id).split("@")[0].split(":")[0] : "";
+  const activeNum = myNumber || sockNum;
+  if (myJid && norm === myJid) return true;
+  if (myLid) {
+    const myLidBase = myLid.split("@")[0].split(":")[0];
+    const jidBase = jid.split("@")[0].split(":")[0];
+    if (jid === myLid || norm === myLid || (myLidBase && jidBase === myLidBase && jid.endsWith("@lid"))) {
+      return true;
+    }
+  }
+  if (activeNum) {
+    const normBase = norm.split("@")[0].split(":")[0];
+    if (normBase === activeNum) return true;
+  }
+  return false;
+}
 
 async function obtenerPermisosGrupo(jid) {
   if (!jid || !jid.endsWith("@g.us")) return false;
@@ -62,7 +291,7 @@ async function obtenerPermisosGrupo(jid) {
       groupMetaCache.set(jid, { announce: false, soloAdmins: false, ts: ahora });
       return false;
     }
-    const myJidNorm = myNumber ? `${myNumber}@s.whatsapp.net` : (sock.user?.id ? jidNormalizedUser(sock.user.id) : "");
+    const myJidNorm = obtenerMiJid();
     const myLidNorm = myLid ? jidNormalizedUser(myLid) : "";
     const soyAdmin = (meta.participants || []).some(p => {
       if (!p || !p.id) return false;
@@ -82,27 +311,7 @@ async function obtenerPermisosGrupo(jid) {
   }
 }
 
-
-let sock = null;
-let isConnected = false;
-let myNumber = "";
-let myName = "";
-let myLid = "75798220378356@lid";
-let currentQR = "";
-let rawQR = "";
-let chatsCache = new Map();
-let messagesCache = new Map();
-let agendaMap = new Map();   // JID / LID -> Nombre guardado por el usuario en su agenda (Google Contacts)
-let pushNameMap = new Map(); // JID / LID -> Apodo que el contacto se puso a si mismo
-let contactsMap = agendaMap; // Alias de compatibilidad
-let lidToJid = new Map();    // LID -> JID
-let jidToLid = new Map();    // JID -> LID
-let presenceMap = new Map();  // JID -> { status: "available"|"composing"|..., t: number }
-let callsList = [];
-
 // Persistencia en disco para que reinicios o redeploys nunca borren nombres ni historiales
-const storeFile = path.join(__dirname, "espos_store.json");
-
 function cargarStoreDisco() {
   try {
     if (fs.existsSync(storeFile)) {
@@ -261,14 +470,14 @@ function formatearHora(ts) {
   try {
     const date = new Date(ts * 1000);
     const ahora = new Date();
-    
+
     const opcionesHora = { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Lima" };
     const opcionesFecha = { day: "2-digit", month: "2-digit", year: "2-digit", timeZone: "America/Lima" };
     const opcionesDiaSem = { weekday: "short", timeZone: "America/Lima" };
 
     const strFechaMsg = date.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
     const strFechaHoy = ahora.toLocaleDateString("en-CA", { timeZone: "America/Lima" });
-    
+
     const dMsg = new Date(strFechaMsg + "T12:00:00Z");
     const dHoy = new Date(strFechaHoy + "T12:00:00Z");
     const diffDias = Math.round((dHoy - dMsg) / (1000 * 60 * 60 * 24));
@@ -330,14 +539,11 @@ function extraerTexto(raw) {
 
 function resolverNombre(jid, pushName, fromMe) {
   if (!jid) return "Contacto";
-  const esPropio = (myNumber && jid.includes(myNumber)) ||
-                   (myLid && (jid === myLid || jid.startsWith(myLid.split("@")[0]))) ||
-                   (jid === "75798220378356@lid");
-  if (esPropio && !jid.endsWith("@g.us")) return "Mensajes Guardados (Tú)";
-  
+  if (esChatPropio(jid)) return "Mensajes Guardados (Tú)";
+
   const alt = lidToJid.get(jid) || jidToLid.get(jid);
 
-  // 1. PRIORIDAD MAXIMA: Agenda del usuario (lo que Gabriel guardo en su telefono)
+  // 1. PRIORIDAD MAXIMA: Agenda del usuario
   const nomAgenda = agendaMap.get(jid) || (alt ? agendaMap.get(alt) : null);
   if (nomAgenda && nomAgenda !== myName && !nomAgenda.startsWith("Contacto WA") && !nomAgenda.startsWith("Comunidad #") && !nomAgenda.startsWith("+")) {
     return nomAgenda;
@@ -390,7 +596,6 @@ function guardarContacto(c) {
     lidToJid.set(c.lid, c.id);
     jidToLid.set(c.id, c.lid);
   }
-  // c.name es el nombre real guardado en la agenda de Google Contacts / telefono del usuario
   if (c.name && c.name !== myName && !c.name.startsWith("+") && !c.name.startsWith("Contacto WA")) {
     if (c.id) agendaMap.set(c.id, c.name);
     if (c.lid) agendaMap.set(c.lid, c.name);
@@ -398,12 +603,10 @@ function guardarContacto(c) {
     if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = c.name;
     programarGuardadoDisco();
   }
-  // c.notify / pushName es el apodo secundario que el emisor se puso a si mismo
   const apodo = c.notify || c.verifiedName;
   if (apodo && apodo !== myName) {
     if (c.id) pushNameMap.set(c.id, apodo);
     if (c.lid) pushNameMap.set(c.lid, apodo);
-    // Solo asignar a chatsCache si NO hay un nombre en agendaMap
     if (c.id && (!agendaMap.has(c.id) || !agendaMap.get(c.id))) {
       if (chatsCache.has(c.id)) {
         const cur = chatsCache.get(c.id).name;
@@ -413,9 +616,6 @@ function guardarContacto(c) {
     programarGuardadoDisco();
   }
 }
-
-// Almacen en memoria de estados recientes de WhatsApp (status@broadcast)
-const estadosMap = new Map(); // id -> item
 
 function procesarEstado(msg, esEnVivo = true) {
   try {
@@ -431,7 +631,7 @@ function procesarEstado(msg, esEnVivo = true) {
     let participant = msg.key?.participant || msg.participant || "";
     const esPropio = Boolean(msg.key?.fromMe);
     if (!participant && esPropio) {
-      participant = sock?.user?.id ? jidNormalizedUser(sock.user.id) : (myNumber ? `${myNumber}@s.whatsapp.net` : "me");
+      participant = obtenerMiJid() || "me";
     }
     if (!participant) return;
 
@@ -530,34 +730,34 @@ function procesarMensaje(msg, esEnVivo = true) {
   }
   if (jid.includes("@broadcast")) return;
 
-  // Unificar chat propio: si el mensaje proviene o va a mi LID o a mi numero, normalizarlo siempre a myJid
-  const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
-  const esPropio = (jid === myLid) || (jid === "75798220378356@lid") ||
-                   (myNumber && jid.includes(myNumber) && !jid.endsWith("@g.us"));
-  if (esPropio) {
+  // Unificar chat propio dinamicamente sin JIDs hardcodeados
+  const myJid = obtenerMiJid();
+  if (esChatPropio(jid) && myJid) {
     jid = myJid;
   }
 
-  // Registrar en rawMediaMap si tiene sticker o audio para descarga bajo demanda
   let innerMsg = msg.message;
   if (innerMsg?.ephemeralMessage?.message) innerMsg = innerMsg.ephemeralMessage.message;
   if (innerMsg?.viewOnceMessage?.message) innerMsg = innerMsg.viewOnceMessage.message;
   if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
   if (innerMsg?.documentWithCaptionMessage?.message) innerMsg = innerMsg.documentWithCaptionMessage.message;
 
+  let sId = "";
   if (msg.key?.id && (innerMsg?.stickerMessage || innerMsg?.audioMessage || innerMsg?.imageMessage || innerMsg?.videoMessage)) {
     rawMediaMap.set(msg.key.id, msg);
-    if (rawMediaMap.size > 500) {
-      const k = rawMediaMap.keys().next().value;
-      rawMediaMap.delete(k);
-    }
-    // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
-    if (innerMsg?.stickerMessage && sharp && esEnVivo) {
-      let sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (innerMsg?.stickerMessage) {
+      sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
       if (innerMsg.stickerMessage.fileSha256) {
         sId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
       }
       if (sId !== msg.key.id) rawMediaMap.set(sId, msg);
+    }
+    while (rawMediaMap.size > 500) {
+      const k = rawMediaMap.keys().next().value;
+      rawMediaMap.delete(k);
+    }
+    // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
+    if (innerMsg?.stickerMessage && sharp && esEnVivo && sId) {
       const rPath = path.join(stickersFolder, `${sId}.raw`);
       if (!fs.existsSync(rPath)) {
         downloadMediaMessage(msg, "buffer", {}, {
@@ -615,7 +815,6 @@ function procesarMensaje(msg, esEnVivo = true) {
 
   const fromMe = Boolean(msg.key?.fromMe);
   const rawTs = msg.messageTimestamp;
-  // Presencia: solo eventos reales de WhatsApp presencia
   const ts = rawTs ? (typeof rawTs === "number" ? rawTs : Number(rawTs.low || rawTs)) : Math.floor(Date.now() / 1000);
   const timeStr = formatearHoraMensaje(ts);
   const timeRel = formatearHora(ts);
@@ -626,22 +825,19 @@ function procesarMensaje(msg, esEnVivo = true) {
   const isRead = Boolean(mStatus === 4 || mStatus === 5);
   let durSec = 0;
   let tipoMsg = "texto";
-  let msgItemId = msg.key.id;
+  const msgItemId = msg.key.id;
   if (innerMsg?.audioMessage?.seconds) {
     durSec = Math.round(Number(innerMsg.audioMessage.seconds));
     tipoMsg = "audio";
   } else if (innerMsg?.stickerMessage) {
     tipoMsg = "sticker";
-    if (innerMsg.stickerMessage.fileSha256) {
-      msgItemId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
-    }
   } else if (innerMsg?.imageMessage) {
     tipoMsg = "foto";
   } else if (innerMsg?.videoMessage) {
     tipoMsg = "video";
     durSec = Math.round(Number(innerMsg.videoMessage.seconds) || 0);
   }
-  lista.push({
+  const pushedItem = {
     id: msgItemId,
     fromMe,
     sender: msg.pushName || (fromMe ? "T\u00fa" : "Contacto"),
@@ -652,7 +848,9 @@ function procesarMensaje(msg, esEnVivo = true) {
     duration: durSec,
     status: mStatus,
     read: isRead
-  });
+  };
+  if (sId) pushedItem.stickerId = sId;
+  lista.push(pushedItem);
   if (lista.length > 30) lista.shift();
 
   // Actualizar chatsCache
@@ -679,6 +877,7 @@ function procesarMensaje(msg, esEnVivo = true) {
 }
 
 async function startWhatsApp() {
+  if (SKIP_WA) return;
   try {
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     let version = [2, 3000, 1015901307];
@@ -705,16 +904,13 @@ async function startWhatsApp() {
       keepAliveIntervalMs: 15000,
       getMessage: async (key) => {
         if (!key?.id) return undefined;
-        // 1. Buscar en el mapa rapido de mensajes completos (por ID)
         if (allMessagesMap.has(key.id)) {
           return allMessagesMap.get(key.id);
         }
-        // 2. Buscar en la cache de mensajes por remoteJid si existe
         if (key.remoteJid && messagesCache.has(key.remoteJid)) {
           const m = messagesCache.get(key.remoteJid).find(x => x.id === key.id);
           if (m) return { conversation: m.text };
         }
-        // 3. Buscar en todas las listas de messagesCache
         for (const list of messagesCache.values()) {
           const m = list.find(x => x.id === key.id);
           if (m) return { conversation: m.text };
@@ -723,124 +919,167 @@ async function startWhatsApp() {
       }
     });
 
-    // ESCUDO TOTAL CONTRA FUGAS DE PRESENCIA EN LINEA (Baileys PushName Bug Fix)
-  // Baileys emite un nodo <presence attrs={{ name }} /> sin atributo 'type' en cada evento creds.update (socket.js:564).
-  // WhatsApp interpreta cualquier presencia sin type o con type='available' como 'En linea' (Online 24/7).
-  // Interceptamos sock.sendNode para bloquear cualquier presencia no autorizada:
-  const rawSendNode = sock.sendNode.bind(sock);
-  sock.sendNode = async (node) => {
-    if (node && node.tag === 'presence') {
-      const pType = node.attrs?.type;
-      if (!pType || pType === 'available') {
-        return; // Descartar silenciosamente fugas de presencia online
-      }
-    }
-    return rawSendNode(node);
-  };
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
-      if (!estaVinculado) {
-        rawQR = qr;
-        currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
-      } else {
-        rawQR = "";
-        currentQR = "";
-      }
-      isConnected = false;
-    }
-
-    if (connection === "close") {
-      isConnected = false;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
-      console.log(`[WhatsApp] Conexión cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        setTimeout(startWhatsApp, 3000);
-      } else {
-        console.log("[WhatsApp] Sesión cerrada formalmente (loggedOut). Purgando credenciales...");
-        try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch (e) {}
-        rawQR = "";
-        currentQR = "";
-        setTimeout(startWhatsApp, 2000);
-      }
-    } else if (connection === "open") {
-      isConnected = true;
-      currentQR = "";
-      rawQR = "";
-      myNumber = sock.user.id.split(":")[0];
-      myName = sock.user.name || "Gab";
-      if (sock.user.lid) {
-        myLid = sock.user.lid.split(":")[0] + "@lid";
-      }
-      if (!myLid && myNumber === "51933961359") {
-        myLid = "75798220378356@lid";
-      }
-      const myJid = `${myNumber}@s.whatsapp.net`;
-      if (myLid) {
-        lidToJid.set(myLid, myJid);
-        jidToLid.set(myJid, myLid);
-      }
-      console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
-      sincronizarGruposReales();
-      try {
-        const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
-        await rawSendNode({
-          tag: 'presence',
-          attrs: {
-            name: meName,
-            type: 'unavailable'
+    // Vinculacion LAN por codigo de emparejamiento via CLI (node server_v340.js <telefono>)
+    const pairingDigits = (!SKIP_WA && !state.creds.registered && process.argv[2])
+      ? String(process.argv[2]).replace(/\D/g, "")
+      : "";
+    if (pairingDigits.length >= 8) {
+      setTimeout(async () => {
+        if (sock && !state.creds.registered) {
+          try {
+            const code = await sock.requestPairingCode(pairingDigits);
+            console.log(`[WhatsApp] Pairing Code LAN: ${code}`);
+          } catch (pe) {
+            console.error("[WhatsApp] Error solicitando Pairing Code:", pe.message);
           }
-        });
-        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') forzada con exito.");
-      } catch (pe) {
-        console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
-      }
+        }
+      }, 3000);
     }
-  });
 
-  if (!global.__presenceWatchdog) {
-    global.__presenceWatchdog = setInterval(async () => {
-      try {
-        if (sock && isConnected) {
-          const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
+    // ESCUDO TOTAL CONTRA FUGAS DE PRESENCIA EN LINEA (Baileys PushName Bug Fix)
+    const rawSendNode = sock.sendNode.bind(sock);
+    sock.sendNode = async (node) => {
+      if (node && node.tag === "presence") {
+        const pType = node.attrs?.type;
+        if (!pType || pType === "available") {
+          return;
+        }
+      }
+      return rawSendNode(node);
+    };
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
+        if (!estaVinculado) {
+          rawQR = qr;
+          currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
+        } else {
+          rawQR = "";
+          currentQR = "";
+        }
+        isConnected = false;
+      }
+
+      if (connection === "close") {
+        isConnected = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
+        console.log(`[WhatsApp] Conexión cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
+        if (shouldReconnect) {
+          setTimeout(startWhatsApp, 3000);
+        } else {
+          console.log("[WhatsApp] Sesión cerrada formalmente (loggedOut). Purgando credenciales...");
+          try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch (e) {}
+          rawQR = "";
+          currentQR = "";
+          setTimeout(startWhatsApp, 2000);
+        }
+      } else if (connection === "open") {
+        isConnected = true;
+        currentQR = "";
+        rawQR = "";
+        myNumber = sock.user.id.split(":")[0].split("@")[0];
+        myName = sock.user.name || "Usuario";
+        if (sock.user.lid) {
+          myLid = sock.user.lid.split(":")[0].split("@")[0] + "@lid";
+        }
+        const myJid = `${myNumber}@s.whatsapp.net`;
+        if (myLid) {
+          lidToJid.set(myLid, myJid);
+          jidToLid.set(myJid, myLid);
+        }
+        console.log(`[WhatsApp] Vinculado exitosamente (${myName})`);
+        sincronizarGruposReales();
+        try {
+          const meName = (myName || sock.user?.name || "Usuario").replace(/@/g, "");
           await rawSendNode({
-            tag: 'presence',
+            tag: "presence",
             attrs: {
               name: meName,
-              type: 'unavailable'
+              type: "unavailable"
             }
           });
+          console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') forzada con exito.");
+        } catch (pe) {
+          console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
         }
-      } catch (_) {}
-    }, 5 * 60 * 1000);
-  }
-
-  sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
-    if (Array.isArray(contacts)) {
-      for (const c of contacts) guardarContacto(c);
-    }
-    if (Array.isArray(messages)) {
-      for (const m of messages) {
-        if (m.key?.id && m.message) {
-          allMessagesMap.set(m.key.id, m.message);
-        }
-        procesarMensaje(m, false);
       }
+    });
+
+    if (!global.__presenceWatchdog) {
+      global.__presenceWatchdog = setInterval(async () => {
+        try {
+          if (sock && isConnected) {
+            const meName = (myName || sock.user?.name || "Usuario").replace(/@/g, "");
+            await rawSendNode({
+              tag: "presence",
+              attrs: {
+                name: meName,
+                type: "unavailable"
+              }
+            });
+          }
+        } catch (_) {}
+      }, 5 * 60 * 1000);
     }
-    if (Array.isArray(chats)) {
-      for (const c of chats) {
+
+    sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
+      if (Array.isArray(contacts)) {
+        for (const c of contacts) guardarContacto(c);
+      }
+      if (Array.isArray(messages)) {
+        for (const m of messages) {
+          if (m.key?.id && m.message) {
+            allMessagesMap.set(m.key.id, m.message);
+            if (allMessagesMap.size > 800) {
+              const firstKey = allMessagesMap.keys().next().value;
+              allMessagesMap.delete(firstKey);
+            }
+          }
+          procesarMensaje(m, false);
+        }
+      }
+      if (Array.isArray(chats)) {
+        for (const c of chats) {
+          if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
+          const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
+          const nom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null) || c.name || resolverNombre(c.id, "", false);
+          const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
+          const ts = Number(rawTs);
+          if (!chatsCache.has(c.id)) {
+            chatsCache.set(c.id, {
+              id: c.id,
+              name: nom,
+              lastMsg: "",
+              time: ts ? formatearHora(ts) : "",
+              unread: c.unreadCount || 0,
+              timestamp: ts
+            });
+          } else {
+            const cur = chatsCache.get(c.id);
+            if (nom && !nom.startsWith("Contacto WA") && (!cur.name || cur.name.startsWith("Contacto WA"))) {
+              cur.name = nom;
+            }
+          }
+        }
+      }
+      programarGuardadoDisco();
+    });
+
+    const onChatsUpdate = (chatsList) => {
+      if (!Array.isArray(chatsList)) return;
+      for (const c of chatsList) {
         if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
-        const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
-        const nom = contactsMap.get(c.id) || (alt ? contactsMap.get(alt) : null) || c.name || resolverNombre(c.id, "", false);
         const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
         const ts = Number(rawTs);
-        if (!chatsCache.has(c.id)) {
+        const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
+        const prev = chatsCache.get(c.id);
+        if (!prev) {
           chatsCache.set(c.id, {
             id: c.id,
             name: nom,
@@ -850,158 +1089,126 @@ async function startWhatsApp() {
             timestamp: ts
           });
         } else {
-          const cur = chatsCache.get(c.id);
-          if (nom && !nom.startsWith("Contacto WA") && (!cur.name || cur.name.startsWith("Contacto WA"))) {
-            cur.name = nom;
+          if (nom && nom !== prev.name && !nom.startsWith("+") && !nom.startsWith("Contacto")) prev.name = nom;
+          if (ts > (prev.timestamp || 0)) {
+            prev.timestamp = ts;
+            prev.time = formatearHora(ts);
+          }
+          if (typeof c.unreadCount === "number") prev.unread = c.unreadCount;
+        }
+      }
+    };
+    sock.ev.on("chats.upsert", onChatsUpdate);
+    sock.ev.on("chats.update", onChatsUpdate);
+
+    const onContacts = (list) => {
+      for (const c of list) {
+        guardarContacto(c);
+        const nom = resolverNombre(c.id, c.notify || c.verifiedName, false);
+        if (c && nom && nom !== myName) {
+          if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
+          if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
+        }
+        if (c && c.id) {
+          const safeId = c.id.replace(/[^a-zA-Z0-9]/g, "_");
+          try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
+          if (c.lid) {
+            const safeLid = c.lid.replace(/[^a-zA-Z0-9]/g, "_");
+            try { if (fs.existsSync(path.join(avatarsFolder, `${safeLid}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeLid}.raw`)); } catch (_) {}
           }
         }
       }
-    }
-    programarGuardadoDisco();
-    if (Array.isArray(messages)) {
-      for (const m of messages) procesarMensaje(m, false);
-    }
-  });
-
-  // Manejo de actualizacion dinamica de chats en tiempo real
-  const onChatsUpdate = (chatsList) => {
-    if (!Array.isArray(chatsList)) return;
-    for (const c of chatsList) {
-      if (!c.id || c.id.includes("@broadcast") || c.id.includes("status@broadcast")) continue;
-      const rawTs = c.conversationTimestamp?.low || c.conversationTimestamp || c.lastMessageRecvTimestamp || c.lastMsgTimestamp || 0;
-      const ts = Number(rawTs);
-      const nom = contactsMap.get(c.id) || (c.lid ? contactsMap.get(c.lid) : null) || c.name || resolverNombre(c.id, "", false);
-      const prev = chatsCache.get(c.id);
-      if (!prev) {
-        chatsCache.set(c.id, {
-          id: c.id,
-          name: nom,
-          lastMsg: "",
-          time: ts ? formatearHora(ts) : "",
-          unread: c.unreadCount || 0,
-          timestamp: ts
-        });
-      } else {
-        if (nom && nom !== prev.name && !nom.startsWith("+") && !nom.startsWith("Contacto")) prev.name = nom;
-        if (ts > (prev.timestamp || 0)) {
-          prev.timestamp = ts;
-          prev.time = formatearHora(ts);
-        }
-        if (typeof c.unreadCount === "number") prev.unread = c.unreadCount;
-      }
-    }
-  };
-  sock.ev.on("chats.upsert", onChatsUpdate);
-  sock.ev.on("chats.update", onChatsUpdate);
-
-  const onContacts = (list) => {
-    for (const c of list) {
-      guardarContacto(c);
-      const nom = resolverNombre(c.id, c.notify || c.verifiedName, false);
-      if (c && nom && nom !== myName) {
-        if (chatsCache.has(c.id)) chatsCache.get(c.id).name = nom;
-        if (c.lid && chatsCache.has(c.lid)) chatsCache.get(c.lid).name = nom;
-      }
-      // Purgar avatar en disco si el contacto se actualizo para descargar la foto mas reciente
-      if (c && c.id) {
-        const safeId = c.id.replace(/[^a-zA-Z0-9]/g, "_");
-        try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
-        if (c.lid) {
-          const safeLid = c.lid.replace(/[^a-zA-Z0-9]/g, "_");
-          try { if (fs.existsSync(path.join(avatarsFolder, `${safeLid}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeLid}.raw`)); } catch (_) {}
-        }
-      }
-    }
-  };
-  sock.ev.on("contacts.upsert", onContacts);
-  sock.ev.on("contacts.update", onContacts);
+    };
+    sock.ev.on("contacts.upsert", onContacts);
+    sock.ev.on("contacts.update", onContacts);
 
     sock.ev.on("groups.update", async (updates) => {
-    for (const u of updates) {
-      if (u?.id) {
-        groupMetaCache.delete(u.id);
-        const safeId = u.id.replace(/[^a-zA-Z0-9]/g, "_");
-        try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
-      }
-    }
-  });
-  sock.ev.on("group-participants.update", async (update) => {
-    if (update?.id) groupMetaCache.delete(update.id);
-  });
-  sock.ev.on("messages.upsert", ({ messages, type }) => {
-    for (const m of messages) {
-      if (m.key?.id && m.message) {
-        allMessagesMap.set(m.key.id, m.message);
-        if (allMessagesMap.size > 800) {
-          const firstKey = allMessagesMap.keys().next().value;
-          allMessagesMap.delete(firstKey);
+      for (const u of updates) {
+        if (u?.id) {
+          groupMetaCache.delete(u.id);
+          const safeId = u.id.replace(/[^a-zA-Z0-9]/g, "_");
+          try { if (fs.existsSync(path.join(avatarsFolder, `${safeId}.raw`))) fs.unlinkSync(path.join(avatarsFolder, `${safeId}.raw`)); } catch (_) {}
         }
       }
-      procesarMensaje(m, true);
-    }
-  });
+    });
+    sock.ev.on("group-participants.update", async (update) => {
+      if (update?.id) groupMetaCache.delete(update.id);
+    });
 
-  sock.ev.on("presence.update", ({ id, presences }) => {
-    if (!presences) return;
-    for (const [sender, p] of Object.entries(presences)) {
-      const j = id || sender;
-      const st = p.lastKnownPresence;
-      const cur = presenceMap.get(j) || {};
-      cur.status = st;
-      if (st === "available" || st === "composing" || st === "recording") {
-        cur.t = Date.now();
-      } else if (st === "unavailable") {
-        cur.t = 0;
-        if (p.lastSeen) {
-          const ls = Number(p.lastSeen);
-          cur.lastSeen = ls < 2000000000 ? ls * 1000 : ls;
-        } else {
-          cur.lastSeen = null;
-        }
-      }
-      presenceMap.set(j, cur);
-      const alt = lidToJid.get(j) || jidToLid.get(j);
-      if (alt) presenceMap.set(alt, cur);
-    }
-  });
-
-  sock.ev.on("messages.update", (updates) => {
-    for (const u of updates) {
-      const jid = u.key?.remoteJid;
-      const mid = u.key?.id;
-      if (!jid || !mid) continue;
-      const st = u.update?.status;
-      if (messagesCache.has(jid)) {
-        for (const item of messagesCache.get(jid)) {
-          if (item.id === mid) {
-            if (typeof st === "number") item.status = st;
-            if (st === 4 || st === 5) item.read = true;
-            break;
+    sock.ev.on("messages.upsert", ({ messages }) => {
+      for (const m of messages) {
+        if (m.key?.id && m.message) {
+          allMessagesMap.set(m.key.id, m.message);
+          if (allMessagesMap.size > 800) {
+            const firstKey = allMessagesMap.keys().next().value;
+            allMessagesMap.delete(firstKey);
           }
         }
+        procesarMensaje(m, true);
       }
-      if (chatsCache.has(jid) && (st === 4 || st === 5)) {
-        chatsCache.get(jid).visto = true;
-      }
-    }
-  });
+    });
 
-  sock.ev.on("call", (calls) => {
-    for (const c of calls) {
-      const ts = c.date ? Math.floor(new Date(c.date).getTime() / 1000) : Math.floor(Date.now() / 1000);
-      const cid = c.chatId || c.from;
-      const name = contactsMap.get(cid) || resolverNombre(cid, "", false);
-      callsList.unshift({
-        id: c.id,
-        chatId: cid,
-        name,
-        time: formatearHora(ts),
-        status: c.status,
-        isVideo: Boolean(c.isVideo)
-      });
-      if (callsList.length > 20) callsList.pop();
-    }
-  });
+    sock.ev.on("presence.update", ({ id, presences }) => {
+      if (!presences) return;
+      for (const [sender, p] of Object.entries(presences)) {
+        const j = id || sender;
+        const st = p.lastKnownPresence;
+        const cur = presenceMap.get(j) || {};
+        cur.status = st;
+        if (st === "available" || st === "composing" || st === "recording") {
+          cur.t = Date.now();
+        } else if (st === "unavailable") {
+          cur.t = 0;
+          if (p.lastSeen) {
+            const ls = Number(p.lastSeen);
+            cur.lastSeen = ls < 2000000000 ? ls * 1000 : ls;
+          } else {
+            cur.lastSeen = null;
+          }
+        }
+        presenceMap.set(j, cur);
+        const alt = lidToJid.get(j) || jidToLid.get(j);
+        if (alt) presenceMap.set(alt, cur);
+      }
+    });
+
+    sock.ev.on("messages.update", (updates) => {
+      for (const u of updates) {
+        const jid = u.key?.remoteJid;
+        const mid = u.key?.id;
+        if (!jid || !mid) continue;
+        const st = u.update?.status;
+        if (messagesCache.has(jid)) {
+          for (const item of messagesCache.get(jid)) {
+            if (item.id === mid) {
+              if (typeof st === "number") item.status = st;
+              if (st === 4 || st === 5) item.read = true;
+              break;
+            }
+          }
+        }
+        if (chatsCache.has(jid) && (st === 4 || st === 5)) {
+          chatsCache.get(jid).visto = true;
+        }
+      }
+    });
+
+    sock.ev.on("call", (calls) => {
+      for (const c of calls) {
+        const ts = c.date ? Math.floor(new Date(c.date).getTime() / 1000) : Math.floor(Date.now() / 1000);
+        const cid = c.chatId || c.from;
+        const name = contactsMap.get(cid) || resolverNombre(cid, "", false);
+        callsList.unshift({
+          id: c.id,
+          chatId: cid,
+          name,
+          time: formatearHora(ts),
+          status: c.status,
+          isVideo: Boolean(c.isVideo)
+        });
+        if (callsList.length > 20) callsList.pop();
+      }
+    });
   } catch (err) {
     console.error("[WhatsApp] Error critico en startWhatsApp:", err);
     setTimeout(startWhatsApp, 3000);
@@ -1010,45 +1217,81 @@ async function startWhatsApp() {
 
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
-  const pathname = parsedUrl.pathname;
+  const pathname = parsedUrl.pathname || "/";
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  // Cabeceras de seguridad obligatorias en todas las respuestas (sin CORS *)
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  if (pathname.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store");
+  }
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
+    res.writeHead(405, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
   }
 
-  // Dashboard Web
+  // Guardia Fail-Closed + Rate Limiter en todos los endpoints /api/*
+  if (pathname.startsWith("/api/")) {
+    const clientIp = obtenerIpCliente(req);
+    if (estaBloqueadaIp(clientIp)) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Too Many Requests" }));
+    }
+    if (!EXPECTED_KEY_HASH) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Service Unavailable" }));
+    }
+    if (!verificarApiKey(req)) {
+      registrarFalloAuth(clientIp);
+      res.writeHead(401, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
+    }
+    failedAuthByIp.delete(clientIp);
+  }
+
+  // Dashboard minimalista sin exposicion de PII, estado de chats ni QR
   if (pathname === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    if (isConnected) {
-      return res.end(`<!DOCTYPE html><html><body style="background:#090d12;color:white;text-align:center;padding:40px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #25d366;"><h2 style="color:#25d366;">&#10004; CONECTADO 24/7</h2><p>WhatsApp vinculado: <b>${myName}</b> (${myNumber})</p><p>Chats activos: <b>${chatsCache.size}</b></p></div></body></html>`);
-    } else if (currentQR) {
-      return res.end(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="6"></head><body style="background:#090d12;color:white;text-align:center;padding:40px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #38bdf8;"><h2>Vincular WhatsApp a EspOS</h2><img src="${currentQR}" style="width:260px;height:260px;background:white;padding:10px;border-radius:12px;"><p>Escanea desde WhatsApp &gt; Dispositivos vinculados</p></div></body></html>`);
-    } else {
-      return res.end(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="3"></head><body style="background:#090d12;color:white;text-align:center;padding:50px;font-family:sans-serif;"><h2>Iniciando EspCHAT Bridge...</h2></body></html>`);
-    }
+    return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${escapeHtml("EspOS Bridge")}</title></head><body style="background:#090d12;color:#e2e8f0;text-align:center;padding:48px;font-family:sans-serif;"><div style="max-width:420px;margin:auto;background:#131b24;border-radius:20px;padding:30px;border:1px solid #1e293b;"><h2>${escapeHtml("EspOS Bridge Service — Active")}</h2></div></body></html>`);
   }
 
-  // API Status
+  // Renombrar contacto (POST JSON { chat, nombre } o GET query)
   if (pathname === "/api/contacto/renombrar" && (req.method === "POST" || req.method === "GET")) {
-    const cJid = parsedUrl.query.chat;
-    const cNom = parsedUrl.query.nombre;
+    let cJid = "";
+    let cNom = "";
+    if (req.method === "POST") {
+      let bodyBuf;
+      try {
+        bodyBuf = await leerBodySeguro(req, 32 * 1024);
+      } catch (err) {
+        return responderErrorBody(res, req, err);
+      }
+      try {
+        const parsed = JSON.parse(bodyBuf.toString("utf8") || "{}");
+        cJid = typeof parsed.chat === "string" ? parsed.chat.trim() : "";
+        cNom = typeof parsed.nombre === "string" ? parsed.nombre.trim() : "";
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "JSON invalido" }));
+      }
+    } else {
+      cJid = typeof parsedUrl.query.chat === "string" ? parsedUrl.query.chat.trim() : "";
+      cNom = typeof parsedUrl.query.nombre === "string" ? parsedUrl.query.nombre.trim() : "";
+    }
     if (cJid && cNom) {
-      agendaMap.set(cJid, cNom.trim());
+      agendaMap.set(cJid, cNom);
       const altJid = lidToJid.get(cJid) || jidToLid.get(cJid);
-      if (altJid) agendaMap.set(altJid, cNom.trim());
-      if (chatsCache.has(cJid)) chatsCache.get(cJid).name = cNom.trim();
-      if (altJid && chatsCache.has(altJid)) chatsCache.get(altJid).name = cNom.trim();
+      if (altJid) agendaMap.set(altJid, cNom);
+      if (chatsCache.has(cJid)) chatsCache.get(cJid).name = cNom;
+      if (altJid && chatsCache.has(altJid)) chatsCache.get(altJid).name = cNom;
       programarGuardadoDisco();
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, jid: cJid, nombre: cNom.trim() }));
+      return res.end(JSON.stringify({ ok: true, jid: cJid, nombre: cNom }));
     }
     res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ error: "Faltan parametros chat y nombre" }));
+    return res.end(JSON.stringify({ ok: false, error: "Faltan parametros chat y nombre" }));
   }
 
   if (pathname === "/api/status" && req.method === "GET") {
@@ -1060,15 +1303,30 @@ const server = http.createServer(async (req, res) => {
       estado: isConnected ? "conectado" : (estaVinculado ? "reconectando" : "esperando_qr"),
       usuario: myName,
       numero: myNumber,
+      miLid: myLid,
       totalChats: chatsCache.size,
       qr: (isConnected || estaVinculado) ? "" : (rawQR || "")
     }));
   }
 
-  // API Chats (Unificado, desduplicado total y clasificado)
-  
-  // Endpoint para vaciar cache de mensajes obsoletos y stickers (Regla de frescura)
-  if ((pathname === "/api/limpiar" || pathname === "/api/vaciar_cache") && req.method === "GET") {
+  // Endpoints destructivos protegidos: solo POST + confirm: true
+  if (pathname === "/api/limpiar" || pathname === "/api/vaciar_cache") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
+    let bodyBuf;
+    try {
+      bodyBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    let body = null;
+    try { body = JSON.parse(bodyBuf.toString("utf8") || "{}"); } catch (_) {}
+    if (!body || body.confirm !== true) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Se requiere confirm: true" }));
+    }
     messagesCache.clear();
     try {
       if (fs.existsSync(stickersFolder)) {
@@ -1083,8 +1341,23 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, mensaje: "Cache de mensajes y stickers vaciado con exito (solo 30 ultimos activos)" }));
   }
 
-  // Endpoint para resetear credenciales corruptas y forzar nuevo QR limpio al instante
-  if ((pathname === "/api/reset_auth" || pathname === "/api/reset") && req.method === "GET") {
+  if (pathname === "/api/reset_auth" || pathname === "/api/reset") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
+    let bodyBuf;
+    try {
+      bodyBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    let body = null;
+    try { body = JSON.parse(bodyBuf.toString("utf8") || "{}"); } catch (_) {}
+    if (!body || body.confirm !== true) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Se requiere confirm: true" }));
+    }
     try {
       if (sock) {
         try { sock.end(); } catch (_) {}
@@ -1096,7 +1369,7 @@ const server = http.createServer(async (req, res) => {
       if (fs.existsSync(authFolder)) {
         fs.rmSync(authFolder, { recursive: true, force: true });
       }
-      setTimeout(startWhatsApp, 1000);
+      if (!SKIP_WA) setTimeout(startWhatsApp, 1000);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true, mensaje: "Sesion reiniciada limpiamente. Generando nuevo QR..." }));
     } catch (e) {
@@ -1105,36 +1378,23 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Endpoint de diagnostico avanzado
-  if (pathname === "/api/diag" && req.method === "GET") {
-    let authFiles = [];
+  if (pathname === "/api/limpiar_sesiones_e2ee") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
+    let bodyBuf;
     try {
-      if (fs.existsSync(authFolder)) {
-        authFiles = fs.readdirSync(authFolder);
-      }
-    } catch (e) {}
-    const sessionFiles = authFiles.filter(f => f.startsWith("session-"));
-    const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      version: "3.3.2",
-      uptime: Math.round(process.uptime()),
-      connected: isConnected,
-      myNumber,
-      myLid,
-      sockUserId: sock?.user?.id || null,
-      authFolderExists: fs.existsSync(authFolder),
-      credsExists: fs.existsSync(path.join(authFolder, "creds.json")),
-      sessionFilesCount: sessionFiles.length,
-      prekeyFilesCount: prekeyFiles.length,
-      sampleSessions: sessionFiles.filter(f => f.includes("51933961359") || f.includes("75798220378356")),
-      allMessagesMapSize: allMessagesMap.size,
-      groupsCached: groupMetaCache.size
-    }));
-  }
-
-  // Endpoint para purgar sesiones Signal desincronizadas (stale) conservando creds.json (sin nuevo QR)
-  if (pathname === "/api/limpiar_sesiones_e2ee" && req.method === "GET") {
+      bodyBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    let body = null;
+    try { body = JSON.parse(bodyBuf.toString("utf8") || "{}"); } catch (_) {}
+    if (!body || body.confirm !== true) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Se requiere confirm: true" }));
+    }
     let eliminados = 0;
     try {
       if (fs.existsSync(authFolder)) {
@@ -1149,7 +1409,7 @@ const server = http.createServer(async (req, res) => {
       if (sock) {
         try { sock.end(); } catch (_) {}
       }
-      setTimeout(startWhatsApp, 1500);
+      if (!SKIP_WA) setTimeout(startWhatsApp, 1500);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         ok: true,
@@ -1162,6 +1422,32 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Endpoint de diagnostico saneado (sin PII ni dump de sesiones)
+  if (pathname === "/api/diag" && req.method === "GET") {
+    let authFiles = [];
+    try {
+      if (fs.existsSync(authFolder)) {
+        authFiles = fs.readdirSync(authFolder);
+      }
+    } catch (e) {}
+    const sessionFiles = authFiles.filter(f => f.startsWith("session-"));
+    const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
+    const estaVinculado = Boolean(myNumber || (sock && sock.user && sock.user.id));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      version: "3.4.0",
+      uptime: Math.round(process.uptime()),
+      connected: isConnected,
+      vinculado: estaVinculado,
+      authFolderExists: fs.existsSync(authFolder),
+      credsExists: fs.existsSync(path.join(authFolder, "creds.json")),
+      sessionFilesCount: sessionFiles.length,
+      prekeyFilesCount: prekeyFiles.length,
+      allMessagesMapSize: allMessagesMap.size,
+      groupsCached: groupMetaCache.size
+    }));
+  }
+
   // API Estados de WhatsApp (Novedades / Historias)
   if (pathname === "/api/estados" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -1169,8 +1455,72 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, total: list.length, estados: list }));
   }
 
+  // Publicar estado de texto en WhatsApp (POST /api/estado)
+  if (pathname === "/api/estado") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
+    let bodyBuf;
+    try {
+      bodyBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(bodyBuf.toString("utf8") || "{}");
+    } catch (_) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "JSON invalido" }));
+    }
+    const texto = typeof parsed.texto === "string" ? parsed.texto.trim() : "";
+    if (texto.length < 1 || texto.length > 500) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "texto debe tener entre 1 y 500 caracteres" }));
+    }
+    if (!sock || !isConnected) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "WhatsApp no conectado" }));
+    }
+    const bgColor = (typeof parsed.color === "string" && /^#[0-9a-fA-F]{6}$/.test(parsed.color.trim()))
+      ? parsed.color.trim()
+      : "#075E54";
+    try {
+      const sent = await sock.sendMessage("status@broadcast", { text: texto }, { backgroundColor: bgColor, font: 0 });
+      const id = sent?.key?.id || ("st_" + Date.now());
+      const ts = Math.floor(Date.now() / 1000);
+      const hex = bgColor.slice(1);
+      const r = parseInt(hex.slice(0, 2), 16) || 7;
+      const g = parseInt(hex.slice(2, 4), 16) || 94;
+      const b = parseInt(hex.slice(4, 6), 16) || 84;
+      const bg565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+
+      estadosMap.set(id, {
+        id,
+        autor: "Tú",
+        participant: obtenerMiJid() || "me",
+        tipo: "texto",
+        texto: texto.substring(0, 160),
+        hora: formatearHora(ts),
+        timestamp: ts,
+        esFoto: 0,
+        bg565
+      });
+      if (estadosMap.size > 50) {
+        const oldestKey = estadosMap.keys().next().value;
+        estadosMap.delete(oldestKey);
+      }
+      programarGuardadoDisco();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, id }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+  }
+
   if (pathname === "/api/chats" && req.method === "GET") {
-    // Sincronizar chatsCache con el mensaje mas reciente de messagesCache solo si es mas nuevo
     for (const [jid, mList] of messagesCache.entries()) {
       if (Array.isArray(mList) && mList.length > 0) {
         const ult = mList[mList.length - 1];
@@ -1191,13 +1541,10 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
-    const myLidStr = myLid || "75798220378356@lid";
-
-    // Unificar cualquier rastro de mi propio LID dentro de myJid ("Mensajes Guardados (Tú)")
-    for (const lidKey of [myLidStr, "75798220378356@lid"]) {
-      if (chatsCache.has(lidKey)) {
-        const cLid = chatsCache.get(lidKey);
+    const myJid = obtenerMiJid();
+    if (myJid && myLid && myLid !== myJid) {
+      if (chatsCache.has(myLid)) {
+        const cLid = chatsCache.get(myLid);
         const cJid = chatsCache.get(myJid);
         if (cJid && cLid) {
           if ((Number(cLid.timestamp) || 0) >= (Number(cJid.timestamp) || 0)) {
@@ -1211,10 +1558,10 @@ const server = http.createServer(async (req, res) => {
           cLid.name = "Mensajes Guardados (Tú)";
           chatsCache.set(myJid, cLid);
         }
-        chatsCache.delete(lidKey);
+        chatsCache.delete(myLid);
       }
-      if (messagesCache.has(lidKey)) {
-        const msgsLid = messagesCache.get(lidKey) || [];
+      if (messagesCache.has(myLid)) {
+        const msgsLid = messagesCache.get(myLid) || [];
         const msgsJid = messagesCache.get(myJid) || [];
         const ids = new Set(msgsJid.map(m => m.id));
         for (const m of msgsLid) {
@@ -1224,16 +1571,17 @@ const server = http.createServer(async (req, res) => {
           }
         }
         msgsJid.sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
-        while (msgsJid.length > 30) msgsJid.shift();
+        while (msgsJid.length > 50) msgsJid.shift();
         messagesCache.set(myJid, msgsJid);
-        messagesCache.delete(lidKey);
+        messagesCache.delete(myLid);
       }
     }
-    if (chatsCache.has(myJid)) {
+    if (myJid && chatsCache.has(myJid)) {
       chatsCache.get(myJid).name = "Mensajes Guardados (Tú)";
     }
 
-    const vistanombres = new Set();
+    const vistosJid = new Set();
+    const vistaPorNombre = new Map(); // nom -> id
     const sorted = Array.from(chatsCache.values())
       .filter(c => c && c.id)
       .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
@@ -1261,7 +1609,6 @@ const server = http.createServer(async (req, res) => {
 
     const list = [];
     for (const c of sorted) {
-      // Excluir stubs vacios de LID que no tienen nombre real ni mensajes
       const esLidSinMensajes = c.id.endsWith("@lid") && (!c.lastMsg || c.lastMsg === "") && (!c.name || c.name.startsWith("Contacto WA"));
       if (esLidSinMensajes) continue;
       const alt = lidToJid.get(c.id) || jidToLid.get(c.id);
@@ -1273,7 +1620,6 @@ const server = http.createServer(async (req, res) => {
         c.lastMsg = "";
       }
 
-      // Si lastMsg sigue vacio, buscar el ultimo mensaje en messagesCache
       if (!c.lastMsg || c.lastMsg === "") {
         const mList = messagesCache.get(c.id) || (alt ? messagesCache.get(alt) : null);
         if (mList && mList.length > 0) {
@@ -1288,26 +1634,32 @@ const server = http.createServer(async (req, res) => {
       }
 
       const peer = lidToJid.get(c.id) || jidToLid.get(c.id) || c.id;
-      if (vistanombres.has(peer) || vistanombres.has(c.id)) continue;
+      if (vistosJid.has(peer) || vistosJid.has(c.id)) continue;
 
+      // Deduplicacion estricta por nombre: solo fusionar si uno es @lid y el otro @s.whatsapp.net
       const isPersonal = !c.id.endsWith("@g.us") && !c.id.endsWith("@newsletter");
       const nom = (c.name || "").trim().toLowerCase();
       const esNombreValido = isPersonal && nom.length >= 3 &&
                              !nom.startsWith("contacto wa") &&
                              !nom.startsWith("+") &&
                              !nom.startsWith("comunidad");
-      if (esNombreValido && vistanombres.has("NOM:" + nom)) continue;
+      if (esNombreValido && vistaPorNombre.has(nom)) {
+        const prevId = vistaPorNombre.get(nom);
+        const esParLidJid = (prevId.endsWith("@lid") && c.id.endsWith("@s.whatsapp.net")) ||
+                            (prevId.endsWith("@s.whatsapp.net") && c.id.endsWith("@lid"));
+        if (esParLidJid) continue;
+      }
 
-      vistanombres.add(peer);
-      vistanombres.add(c.id);
-      if (esNombreValido) vistanombres.add("NOM:" + nom);
-      
-      // Indicar si es canal
+      vistosJid.add(peer);
+      vistosJid.add(c.id);
+      if (esNombreValido && !vistaPorNombre.has(nom)) {
+        vistaPorNombre.set(nom, c.id);
+      }
+
       if (c.id.endsWith("@newsletter")) {
         c.esCanal = true;
         c.soloAdmins = true;
       }
-      // Indicar si es grupo y si solo administradores pueden hablar
       if (c.id.endsWith("@g.us")) {
         c.esGrupo = true;
         if (groupMetaCache.has(c.id)) {
@@ -1329,6 +1681,7 @@ const server = http.createServer(async (req, res) => {
       estado: isConnected ? "conectado" : (estaVinculado ? "reconectando" : "esperando_qr"),
       usuario: myName,
       numero: myNumber,
+      miLid: myLid,
       totalChats: chatsCache.size,
       qr: (isConnected || estaVinculado) ? "" : (rawQR || ""),
       chats: list,
@@ -1337,10 +1690,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/api/mensajes" && req.method === "GET") {
-    let chatJid = parsedUrl.query.chat;
-    const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : "51933961359@s.whatsapp.net";
-    const myLidStr = myLid || "75798220378356@lid";
-    if (chatJid === myLidStr || chatJid === "75798220378356@lid" || (myNumber && chatJid && chatJid.includes(myNumber) && !chatJid.endsWith("@g.us"))) {
+    let chatJid = typeof parsedUrl.query.chat === "string" ? parsedUrl.query.chat.trim() : "";
+    if (!chatJid) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Falta parametro chat" }));
+    }
+    const myJid = obtenerMiJid();
+    if (esChatPropio(chatJid) && myJid) {
       chatJid = myJid;
     }
     if (sock && chatJid) {
@@ -1354,13 +1710,14 @@ const server = http.createServer(async (req, res) => {
     if (msgs.length === 0 && alt && messagesCache.has(alt)) {
       msgs = [...messagesCache.get(alt)];
     }
-    // Si no hay mensajes, intentar buscar por otro chat con el mismo nombre
     if (msgs.length === 0 && chatsCache.has(chatJid)) {
       const cNom = (chatsCache.get(chatJid).name || "").trim().toLowerCase();
       if (cNom.length >= 3 && !cNom.startsWith("contacto wa") && !cNom.startsWith("+")) {
         for (const [otherJid, otherChat] of chatsCache.entries()) {
           if (otherJid !== chatJid && (otherChat.name || "").trim().toLowerCase() === cNom) {
-            if (messagesCache.has(otherJid) && messagesCache.get(otherJid).length > 0) {
+            const esParLidJid = (otherJid.endsWith("@lid") && chatJid.endsWith("@s.whatsapp.net")) ||
+                                (otherJid.endsWith("@s.whatsapp.net") && chatJid.endsWith("@lid"));
+            if (esParLidJid && messagesCache.has(otherJid) && messagesCache.get(otherJid).length > 0) {
               msgs = [...messagesCache.get(otherJid)];
               lidToJid.set(chatJid, otherJid);
               jidToLid.set(otherJid, chatJid);
@@ -1370,13 +1727,11 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    // Incorporar el mensaje mas reciente de chatsCache si messagesCache esta vacio o desfasado
     const info = chatsCache.get(chatJid) || (alt ? chatsCache.get(alt) : null);
     if (info && info.lastMsg && !info.lastMsg.includes("Conversaci") && !info.lastMsg.includes("Toca para")) {
       const lastMsgTs = (msgs.length > 0 && msgs[msgs.length - 1].timestamp) ? Number(msgs[msgs.length - 1].timestamp) : 0;
       const infoTs = Number(info.timestamp || 0);
 
-      // Incorporar el mensaje mas reciente si la lista esta vacia o infoTs es mas nuevo
       if (msgs.length === 0 || (infoTs > 0 && infoTs > lastMsgTs)) {
         const fm = Boolean(info.fromMe);
         msgs.push({
@@ -1392,7 +1747,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (chatsCache.has(chatJid)) chatsCache.get(chatJid).unread = 0;
 
-    // Deduplicar mensajes por id y ordenar estrictamente de mas antiguo a mas reciente
     const mapMsg = new Map();
     for (const m of msgs) {
       if (m && m.id) mapMsg.set(m.id, m);
@@ -1402,7 +1756,6 @@ const server = http.createServer(async (req, res) => {
       msgs = msgs.slice(-30);
     }
 
-    // Resolver presencia en tiempo real con precision oficial (cero falsos 'en linea' ni horas inventadas)
     let presStr = "";
     if (!chatJid.endsWith("@g.us") && !chatJid.endsWith("@newsletter")) {
       const pAlt = lidToJid.get(chatJid) || jidToLid.get(chatJid);
@@ -1419,13 +1772,13 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    res.writeHead(200, { "Content-Type": "application/json" });
-        let restringido = false;
+    let restringido = false;
     if (chatJid.endsWith("@newsletter")) {
       restringido = true;
     } else if (chatJid.endsWith("@g.us")) {
       restringido = await obtenerPermisosGrupo(chatJid);
     }
+    res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ chat: chatJid, presencia: presStr, soloAdmins: Boolean(restringido), mensajes: msgs }));
   }
 
@@ -1439,8 +1792,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const safeId = chatJid.replace(/[^a-zA-Z0-9]/g, "_");
       const rawPath = path.join(avatarsFolder, `${safeId}.raw`);
-      
-      // 1. Si ya esta en cache de disco del servidor y no esta forzado ni expirado (TTL 12h), servirlo
+
       if (!forzar && fs.existsSync(rawPath)) {
         try {
           const st = fs.statSync(rawPath);
@@ -1450,8 +1802,7 @@ const server = http.createServer(async (req, res) => {
             if (rawBuf.length === 42 * 42 * 2) {
               res.writeHead(200, {
                 "Content-Type": "application/octet-stream",
-                "Content-Length": rawBuf.length,
-                "Cache-Control": "public, max-age=43200"
+                "Content-Length": rawBuf.length
               });
               return res.end(rawBuf);
             }
@@ -1459,7 +1810,6 @@ const server = http.createServer(async (req, res) => {
         } catch (_) {}
       }
 
-      // 2. Pedir URL del avatar a WhatsApp con proteccion de timeout de 2.5s
       const withTimeout = (p, ms) => Promise.race([
         p,
         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
@@ -1470,27 +1820,23 @@ const server = http.createServer(async (req, res) => {
         if (alt) ppUrl = await withTimeout(sock.profilePictureUrl(alt, "image"), 2500).catch(() => null);
       }
       if (!ppUrl) {
-        // Si no tiene foto o la quito, borrar foto antigua de disco para ahorrar espacio
         try { if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath); } catch (_) {}
         res.writeHead(404); return res.end();
       }
 
-      // 3. Descargar imagen desde CDN
       const imgRes = await fetch(ppUrl);
       if (!imgRes.ok) {
         res.writeHead(404); return res.end();
       }
       const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
 
-      // 4. Si Sharp esta disponible, redimensionar y convertir a RGB565 nativo
       if (sharp) {
         const { data } = await sharp(imgBuffer)
           .resize(42, 42, { fit: "cover" })
           .removeAlpha()
           .raw()
-          .toBuffer({ resolveWithObject: true }); // 42 * 42 * 3 (RGB888)
+          .toBuffer({ resolveWithObject: true });
 
-        // Convertir RGB888 a RGB565 Little-Endian (formato directo para NavLz)
         const rgb565Buf = Buffer.alloc(42 * 42 * 2);
         for (let i = 0; i < 42 * 42; i++) {
           const r = data[i * 3];
@@ -1500,13 +1846,11 @@ const server = http.createServer(async (req, res) => {
           rgb565Buf.writeUInt16LE(c565, i * 2);
         }
 
-        // Borrar el archivo viejo si existia antes de escribir el nuevo para garantizar espacio limpio
         try { if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath); } catch (_) {}
         fs.writeFileSync(rawPath, rgb565Buf);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
-          "Content-Length": rgb565Buf.length,
-          "Cache-Control": "public, max-age=43200"
+          "Content-Length": rgb565Buf.length
         });
         return res.end(rgb565Buf);
       }
@@ -1530,8 +1874,7 @@ const server = http.createServer(async (req, res) => {
         if (rawBuf.length === 64 * 64 * 2) {
           res.writeHead(200, {
             "Content-Type": "application/octet-stream",
-            "Content-Length": rawBuf.length,
-            "Cache-Control": "public, max-age=604800"
+            "Content-Length": rawBuf.length
           });
           return res.end(rawBuf);
         }
@@ -1566,8 +1909,7 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(rawPath, rgb565);
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
-        "Content-Length": rgb565.length,
-        "Cache-Control": "public, max-age=604800"
+        "Content-Length": rgb565.length
       });
       return res.end(rgb565);
     } catch (se) {
@@ -1576,8 +1918,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Endpoint de Fotos y Portadas de Video One UI: entrega 480x320 RGB565 o JPEG para galeria
-  
   // Endpoint de QR para vinculacion nativa en pantalla ESP32
   if (pathname === "/api/qr" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -1589,7 +1929,7 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === "/api/foto" && req.method === "GET") {
     const msgId = parsedUrl.query.id;
-    const modo = parsedUrl.query.modo || "full"; // "full" (480x320 RGB565) o "jpg" (JPEG para Galería)
+    const modo = parsedUrl.query.modo || "full";
     if (!msgId) { res.writeHead(400); return res.end("Falta id"); }
     try {
       const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -1597,10 +1937,7 @@ const server = http.createServer(async (req, res) => {
       const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
 
       if (modo === "jpg" && fs.existsSync(jpgPath)) {
-        res.writeHead(200, {
-          "Content-Type": "image/jpeg",
-          "Cache-Control": "public, max-age=604800"
-        });
+        res.writeHead(200, { "Content-Type": "image/jpeg" });
         return fs.createReadStream(jpgPath).pipe(res);
       }
 
@@ -1609,8 +1946,7 @@ const server = http.createServer(async (req, res) => {
         if (rawBuf.length === 480 * 320 * 2) {
           res.writeHead(200, {
             "Content-Type": "application/octet-stream",
-            "Content-Length": rawBuf.length,
-            "Cache-Control": "public, max-age=604800"
+            "Content-Length": rawBuf.length
           });
           return res.end(rawBuf);
         }
@@ -1651,7 +1987,6 @@ const server = http.createServer(async (req, res) => {
 
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
 
-      // 1. Guardar copia en JPEG para la Galería si se pide o para cache
       if (!fs.existsSync(jpgPath) || modo === "jpg") {
         const jpgBuf = await sharp(mediaBuf)
           .resize(480, 320, { fit: "inside", withoutEnlargement: true })
@@ -1661,14 +1996,12 @@ const server = http.createServer(async (req, res) => {
         if (modo === "jpg") {
           res.writeHead(200, {
             "Content-Type": "image/jpeg",
-            "Content-Length": jpgBuf.length,
-            "Cache-Control": "public, max-age=604800"
+            "Content-Length": jpgBuf.length
           });
           return res.end(jpgBuf);
         }
       }
 
-      // 2. Generar formato directo RGB565 Little-Endian (480x320 = 307200 bytes)
       const resObj = await sharp(mediaBuf)
         .resize(480, 320, { fit: "contain", background: { r: 9, g: 13, b: 18, alpha: 1 } })
         .flatten({ background: { r: 9, g: 13, b: 18 } })
@@ -1689,8 +2022,7 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(rawPath, rgb565);
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
-        "Content-Length": rgb565.length,
-        "Cache-Control": "public, max-age=604800"
+        "Content-Length": rgb565.length
       });
       return res.end(rgb565);
     } catch (fe) {
@@ -1711,8 +2043,7 @@ const server = http.createServer(async (req, res) => {
         const wavStat = fs.statSync(wavPath);
         res.writeHead(200, {
           "Content-Type": "audio/wav",
-          "Content-Length": wavStat.size,
-          "Cache-Control": "public, max-age=604800"
+          "Content-Length": wavStat.size
         });
         const stream = fs.createReadStream(wavPath);
         return stream.pipe(res);
@@ -1738,8 +2069,7 @@ const server = http.createServer(async (req, res) => {
         const wavStat = fs.statSync(wavPath);
         res.writeHead(200, {
           "Content-Type": "audio/wav",
-          "Content-Length": wavStat.size,
-          "Cache-Control": "public, max-age=604800"
+          "Content-Length": wavStat.size
         });
         const stream = fs.createReadStream(wavPath);
         stream.pipe(res);
@@ -1751,362 +2081,351 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // API Enviar mensaje
+  // API Enviar mensaje (limite 32 KB streaming)
   if (pathname === "/api/enviar" && req.method === "POST") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        let { chat, texto } = JSON.parse(body);
-        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
-        const myLidStr = myLid || "75798220378356@lid";
-        
-        // Normalizacion estricta para mensajes a uno mismo ("Mensajes Guardados (Tu)")
-        // Usar SIEMPRE jidNormalizedUser para que WhatsApp E2EE lo entregue al telefono primario
-        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
-                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
-                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
-        
-        if (isSelf) {
-          chat = jidNormalizedUser(sock?.user?.id || myJid);
-        } else {
-          chat = jidNormalizedUser(chat);
-        }
-
-        if (!chat || !texto || !sock) {
-          res.writeHead(400); return res.end();
-        }
-
-        if (chat.endsWith("@g.us")) {
-          const restringido = await obtenerPermisosGrupo(chat);
-          if (restringido) {
-            res.writeHead(403, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
-          }
-        }
-        let sent;
-        let isStk = false;
-        const stkMatch = (typeof texto === "string") ? texto.match(/^\[Sticker:(.+)\]$/) : null;
-        if (stkMatch) {
-          isStk = true;
-          const stkId = stkMatch[1].replace(/[^a-zA-Z0-9_-]/g, "_");
-          const webpPath = path.join(stickersFolder, `${stkId}.webp`);
-          const rawPath = path.join(stickersFolder, `${stkId}.raw`);
-          if (fs.existsSync(webpPath)) {
-            sent = await sock.sendMessage(chat, { sticker: fs.readFileSync(webpPath) });
-          } else if (rawMediaMap.has(stkId)) {
-            try {
-              const rawMsg = rawMediaMap.get(stkId);
-              const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-                logger: pino({ level: "silent" }),
-                reuploadRequest: sock?.updateMediaMessage
-              });
-              if (mediaBuf) {
-                try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
-                sent = await sock.sendMessage(chat, { sticker: mediaBuf });
-              }
-            } catch (_) {}
-          }
-          if (!sent && fs.existsSync(rawPath) && sharp) {
-            try {
-              const rawBuf = fs.readFileSync(rawPath);
-              const rgbaBuf = Buffer.alloc(64 * 64 * 4);
-              for (let i = 0; i < 64 * 64; i++) {
-                const c16 = rawBuf.readUInt16LE(i * 2);
-                const r = ((c16 >> 11) & 0x1F) * 255 / 31;
-                const g = ((c16 >> 5) & 0x3F) * 255 / 63;
-                const b = (c16 & 0x1F) * 255 / 31;
-                rgbaBuf[i * 4] = Math.round(r);
-                rgbaBuf[i * 4 + 1] = Math.round(g);
-                rgbaBuf[i * 4 + 2] = Math.round(b);
-                rgbaBuf[i * 4 + 3] = 255;
-              }
-              const webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } }).webp().toBuffer();
-              sent = await sock.sendMessage(chat, { sticker: webpBuf });
-            } catch (_) {}
-          }
-          if (!sent) {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ ok: false, error: "Sticker no disponible en servidor" }));
-          }
-        } else {
-          sent = await sock.sendMessage(chat, { text: texto });
-        }
-        const displayTxt = isStk ? "[Sticker]" : texto;
-        if (sent?.key?.id) {
-          allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
-        }
-        const ts = Math.floor(Date.now() / 1000);
-        const timeStr = formatearHoraMensaje(ts);
-        const timeRel = formatearHora(ts);
-
-        const newMsgItem = {
-          id: sent.key.id,
-          fromMe: true,
-          sender: myName || "Tú",
-          text: displayTxt,
-          time: timeStr,
-          timestamp: ts,
-          status: 2,
-          read: false
-        };
-
-        if (!messagesCache.has(chat)) messagesCache.set(chat, []);
-        messagesCache.get(chat).push(newMsgItem);
-        if (messagesCache.get(chat).length > 50) messagesCache.get(chat).shift();
-
-        const alt = lidToJid.get(chat) || jidToLid.get(chat);
-        if (alt) {
-          if (!messagesCache.has(alt)) messagesCache.set(alt, []);
-          messagesCache.get(alt).push(newMsgItem);
-          if (messagesCache.get(alt).length > 50) messagesCache.get(alt).shift();
-        }
-
-        if (chatsCache.has(chat)) {
-          const c = chatsCache.get(chat);
-          c.lastMsg = displayTxt;
-          c.time = timeRel;
-          c.timestamp = ts;
-          c.fromMe = true;
-          c.unread = 0;
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: err.message }));
+    let bodyBuf;
+    try {
+      bodyBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    try {
+      let { chat, texto } = JSON.parse(bodyBuf.toString("utf8"));
+      const myJid = obtenerMiJid();
+      if (esChatPropio(chat)) {
+        chat = sock?.user?.id ? jidNormalizedUser(sock.user.id) : myJid;
+      } else if (chat) {
+        chat = jidNormalizedUser(chat);
       }
-    });
-    return;
+
+      if (!chat || !texto || !sock) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "Parametros invalidos o WhatsApp no conectado" }));
+      }
+
+      if (chat.endsWith("@g.us")) {
+        const restringido = await obtenerPermisosGrupo(chat);
+        if (restringido) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, error: "Solo administradores pueden enviar mensajes en este grupo" }));
+        }
+      }
+      let sent;
+      let isStk = false;
+      const stkMatch = (typeof texto === "string") ? texto.match(/^\[Sticker:(.+)\]$/) : null;
+      if (stkMatch) {
+        isStk = true;
+        const stkId = stkMatch[1].replace(/[^a-zA-Z0-9_-]/g, "_");
+        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+        if (fs.existsSync(webpPath)) {
+          sent = await sock.sendMessage(chat, { sticker: fs.readFileSync(webpPath) });
+        } else if (rawMediaMap.has(stkId)) {
+          try {
+            const rawMsg = rawMediaMap.get(stkId);
+            const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+              logger: pino({ level: "silent" }),
+              reuploadRequest: sock?.updateMediaMessage
+            });
+            if (mediaBuf) {
+              try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
+              sent = await sock.sendMessage(chat, { sticker: mediaBuf });
+            }
+          } catch (_) {}
+        }
+        if (!sent && fs.existsSync(rawPath) && sharp) {
+          try {
+            const rawBuf = fs.readFileSync(rawPath);
+            const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+            for (let i = 0; i < 64 * 64; i++) {
+              const c16 = rawBuf.readUInt16LE(i * 2);
+              const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+              const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+              const b = (c16 & 0x1F) * 255 / 31;
+              rgbaBuf[i * 4] = Math.round(r);
+              rgbaBuf[i * 4 + 1] = Math.round(g);
+              rgbaBuf[i * 4 + 2] = Math.round(b);
+              rgbaBuf[i * 4 + 3] = 255;
+            }
+            const webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } }).webp().toBuffer();
+            sent = await sock.sendMessage(chat, { sticker: webpBuf });
+          } catch (_) {}
+        }
+        if (!sent) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, error: "Sticker no disponible en servidor" }));
+        }
+      } else {
+        sent = await sock.sendMessage(chat, { text: texto });
+      }
+      const displayTxt = isStk ? "[Sticker]" : texto;
+      if (sent?.key?.id) {
+        allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
+      }
+      const ts = Math.floor(Date.now() / 1000);
+      const timeStr = formatearHoraMensaje(ts);
+      const timeRel = formatearHora(ts);
+
+      const newMsgItem = {
+        id: sent.key.id,
+        fromMe: true,
+        sender: myName || "Tú",
+        text: displayTxt,
+        time: timeStr,
+        timestamp: ts,
+        status: 2,
+        read: false
+      };
+
+      if (!messagesCache.has(chat)) messagesCache.set(chat, []);
+      messagesCache.get(chat).push(newMsgItem);
+      if (messagesCache.get(chat).length > 50) messagesCache.get(chat).shift();
+
+      const alt = lidToJid.get(chat) || jidToLid.get(chat);
+      if (alt) {
+        if (!messagesCache.has(alt)) messagesCache.set(alt, []);
+        messagesCache.get(alt).push(newMsgItem);
+        if (messagesCache.get(alt).length > 50) messagesCache.get(alt).shift();
+      }
+
+      if (chatsCache.has(chat)) {
+        const c = chatsCache.get(chat);
+        c.lastMsg = displayTxt;
+        c.time = timeRel;
+        c.timestamp = ts;
+        c.fromMe = true;
+        c.unread = 0;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
   }
 
-  // API Enviar Nota de Voz oficial (PTT)
+  // API Enviar Nota de Voz oficial (PTT, limite 2.5 MB streaming)
   if (pathname === "/api/enviar_audio" && req.method === "POST") {
+    let audioBuf;
+    try {
+      audioBuf = await leerBodySeguro(req, 2.5 * 1024 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
     const chat = parsedUrl.query.chat;
     if (!chat || !sock) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
     }
-    const chunks = [];
-    req.on("data", chunk => chunks.push(chunk));
-    req.on("end", async () => {
-      try {
-        const audioBuf = Buffer.concat(chunks);
-        if (audioBuf.length < 100) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "Audio vacio o corrupto" }));
-        }
-
-        // Transcodificar WAV (16kHz PCM) a Ogg Opus para WhatsApp PTT
-        const tmpId = Date.now() + "_" + Math.floor(Math.random() * 10000);
-        const inWav = path.join(audioFolder, `in_${tmpId}.wav`);
-        const outOgg = path.join(audioFolder, `out_${tmpId}.ogg`);
-        fs.writeFileSync(inWav, audioBuf);
-
-        const transcodeToOpus = (codec) => new Promise((resolve, reject) => {
-          execFile("ffmpeg", ["-y", "-i", inWav, "-c:a", codec, "-b:a", "32k", "-vbr", "on", "-application", "voip", outOgg], (err) => {
-            if (err) return reject(err);
-            if (!fs.existsSync(outOgg) || fs.statSync(outOgg).size === 0) return reject(new Error("Ogg vacio"));
-            resolve(fs.readFileSync(outOgg));
-          });
-        });
-
-        let oggBuf;
-        try {
-          oggBuf = await transcodeToOpus("libopus");
-        } catch (e1) {
-          console.warn("[Audio] Reintentando transcode con codec opus...");
-          try {
-            oggBuf = await transcodeToOpus("opus");
-          } catch (e2) {
-            console.error("[Audio] Fallo transcode ffmpeg:", e2.message);
-            oggBuf = audioBuf;
-          }
-        } finally {
-          try { if (fs.existsSync(inWav)) fs.unlinkSync(inWav); } catch (_) {}
-          try { if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg); } catch (_) {}
-        }
-
-        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
-        const myLidStr = myLid || "75798220378356@lid";
-        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
-                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
-                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
-        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
-
-        const isOgg = (oggBuf !== audioBuf);
-        const sent = await sock.sendMessage(targetChat, {
-          audio: oggBuf,
-          mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
-          ptt: true
-        });
-        if (sent?.key?.id) {
-          allMessagesMap.set(sent.key.id, sent.message);
-        }
-
-        // Guardar WAV original para que la consola EspOS pueda reproducir su propio audio de inmediato
-        if (sent?.key?.id) {
-          const safeAudioId = sent.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
-          try {
-            fs.writeFileSync(path.join(audioFolder, `${safeAudioId}.wav`), audioBuf);
-          } catch (_) {}
-        }
-
-        const ts = Math.floor(Date.now() / 1000);
-        const timeStr = formatearHoraMensaje(ts);
-        const timeRel = formatearHora(ts);
-
-        const newMsgItem = {
-          id: sent.key.id,
-          fromMe: true,
-          sender: myName || "Tú",
-          text: "[Nota de voz]",
-          time: timeStr,
-          timestamp: ts,
-          status: 2,
-          read: false
-        };
-
-        if (!messagesCache.has(chat)) messagesCache.set(chat, []);
-        messagesCache.get(chat).push(newMsgItem);
-
-        if (chatsCache.has(chat)) {
-          const c = chatsCache.get(chat);
-          c.lastMsg = "[Nota de voz]";
-          c.time = timeRel;
-          c.timestamp = ts;
-          c.fromMe = true;
-          c.unread = 0;
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
-      } catch (e) {
-        console.error("[Audio] Error:", e);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ error: e.message }));
+    try {
+      if (audioBuf.length < 100) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Audio vacio o corrupto" }));
       }
-    });
-    return;
+
+      const tmpId = Date.now() + "_" + Math.floor(Math.random() * 10000);
+      const inWav = path.join(audioFolder, `in_${tmpId}.wav`);
+      const outOgg = path.join(audioFolder, `out_${tmpId}.ogg`);
+      fs.writeFileSync(inWav, audioBuf);
+
+      const transcodeToOpus = (codec) => new Promise((resolve, reject) => {
+        execFile("ffmpeg", ["-y", "-i", inWav, "-c:a", codec, "-b:a", "32k", "-vbr", "on", "-application", "voip", outOgg], (err) => {
+          if (err) return reject(err);
+          if (!fs.existsSync(outOgg) || fs.statSync(outOgg).size === 0) return reject(new Error("Ogg vacio"));
+          resolve(fs.readFileSync(outOgg));
+        });
+      });
+
+      let oggBuf;
+      try {
+        oggBuf = await transcodeToOpus("libopus");
+      } catch (e1) {
+        console.warn("[Audio] Reintentando transcode con codec opus...");
+        try {
+          oggBuf = await transcodeToOpus("opus");
+        } catch (e2) {
+          console.error("[Audio] Fallo transcode ffmpeg:", e2.message);
+          oggBuf = audioBuf;
+        }
+      } finally {
+        try { if (fs.existsSync(inWav)) fs.unlinkSync(inWav); } catch (_) {}
+        try { if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg); } catch (_) {}
+      }
+
+      const myJid = obtenerMiJid();
+      const targetChat = esChatPropio(chat)
+        ? (sock?.user?.id ? jidNormalizedUser(sock.user.id) : myJid)
+        : jidNormalizedUser(chat);
+
+      const isOgg = (oggBuf !== audioBuf);
+      const sent = await sock.sendMessage(targetChat, {
+        audio: oggBuf,
+        mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
+        ptt: true
+      });
+      if (sent?.key?.id) {
+        allMessagesMap.set(sent.key.id, sent.message);
+      }
+
+      if (sent?.key?.id) {
+        const safeAudioId = sent.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+        try {
+          fs.writeFileSync(path.join(audioFolder, `${safeAudioId}.wav`), audioBuf);
+        } catch (_) {}
+      }
+
+      const ts = Math.floor(Date.now() / 1000);
+      const timeStr = formatearHoraMensaje(ts);
+      const timeRel = formatearHora(ts);
+
+      const newMsgItem = {
+        id: sent.key.id,
+        fromMe: true,
+        sender: myName || "Tú",
+        text: "[Nota de voz]",
+        time: timeStr,
+        timestamp: ts,
+        status: 2,
+        read: false
+      };
+
+      if (!messagesCache.has(chat)) messagesCache.set(chat, []);
+      messagesCache.get(chat).push(newMsgItem);
+
+      if (chatsCache.has(chat)) {
+        const c = chatsCache.get(chat);
+        c.lastMsg = "[Nota de voz]";
+        c.time = timeRel;
+        c.timestamp = ts;
+        c.fromMe = true;
+        c.unread = 0;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+    } catch (e) {
+      console.error("[Audio] Error:", e);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
   }
 
-
-  // API Enviar Sticker Nativo One UI (entrega stream 64x64 RGB565 -> WebP 512x512)
+  // API Enviar Sticker Nativo One UI (limite 32 KB streaming)
   if (pathname === "/api/enviar_sticker" && req.method === "POST") {
-    let chat = parsedUrl.query.chat;
+    let rawBuf;
+    try {
+      rawBuf = await leerBodySeguro(req, 32 * 1024);
+    } catch (err) {
+      return responderErrorBody(res, req, err);
+    }
+    const chat = parsedUrl.query.chat;
     const stkId = (parsedUrl.query.id || ("stk_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "_");
     if (!chat || !sock) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
     }
-    const chunks = [];
-    req.on("data", chunk => chunks.push(chunk));
-    req.on("end", async () => {
-      try {
-        const rawBuf = Buffer.concat(chunks);
-        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
-        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
-        let webpBuf = null;
+    try {
+      const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+      const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+      let webpBuf = null;
 
-        if (rawBuf.length === 64 * 64 * 2) {
-          // Convertir RGB565 Little-Endian (64x64) a RGBA
-          const rgbaBuf = Buffer.alloc(64 * 64 * 4);
-          for (let i = 0; i < 64 * 64; i++) {
-            const c16 = rawBuf.readUInt16LE(i * 2);
-            const r = ((c16 >> 11) & 0x1F) * 255 / 31;
-            const g = ((c16 >> 5) & 0x3F) * 255 / 63;
-            const b = (c16 & 0x1F) * 255 / 31;
-            rgbaBuf[i * 4] = Math.round(r);
-            rgbaBuf[i * 4 + 1] = Math.round(g);
-            rgbaBuf[i * 4 + 2] = Math.round(b);
-            rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
-          }
+      if (rawBuf.length === 64 * 64 * 2) {
+        const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+        for (let i = 0; i < 64 * 64; i++) {
+          const c16 = rawBuf.readUInt16LE(i * 2);
+          const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+          const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+          const b = (c16 & 0x1F) * 255 / 31;
+          rgbaBuf[i * 4] = Math.round(r);
+          rgbaBuf[i * 4 + 1] = Math.round(g);
+          rgbaBuf[i * 4 + 2] = Math.round(b);
+          rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
+        }
 
-          if (sharp) {
-            webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
-              .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-              .webp({ quality: 90 })
-              .toBuffer();
-          } else {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
-          }
-          try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+        if (sharp) {
+          webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
+            .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp({ quality: 90 })
+            .toBuffer();
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
+        }
+        try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+        if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
+      } else if (fs.existsSync(webpPath)) {
+        webpBuf = fs.readFileSync(webpPath);
+      } else if (rawMediaMap.has(stkId)) {
+        try {
+          const rawMsg = rawMediaMap.get(stkId);
+          webpBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+            logger: pino({ level: "silent" }),
+            reuploadRequest: sock?.updateMediaMessage
+          });
           if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
-        } else if (fs.existsSync(webpPath)) {
-          webpBuf = fs.readFileSync(webpPath);
-        } else if (rawMediaMap.has(stkId)) {
-          try {
-            const rawMsg = rawMediaMap.get(stkId);
-            webpBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-              logger: pino({ level: "silent" }),
-              reuploadRequest: sock?.updateMediaMessage
-            });
-            if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
-          } catch (_) {}
-        }
-
-        if (!webpBuf) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "Sticker invalido: debe enviar 8192 bytes o id existente" }));
-        }
-
-        const myJid = myNumber ? `${myNumber}@s.whatsapp.net` : (sock?.user?.id ? jidNormalizedUser(sock.user.id) : "51933961359@s.whatsapp.net");
-        const myLidStr = myLid || "75798220378356@lid";
-        const isSelf = (chat === myLidStr || chat === "75798220378356@lid" || 
-                        (myNumber && chat && chat.includes(myNumber) && !chat.endsWith("@g.us")) ||
-                        (sock?.user?.id && chat && chat.includes(jidNormalizedUser(sock.user.id).split("@")[0])));
-        const targetChat = isSelf ? jidNormalizedUser(sock?.user?.id || myJid) : jidNormalizedUser(chat);
-
-        const sent = await sock.sendMessage(targetChat, {
-          sticker: webpBuf
-        });
-
-        if (sent?.key?.id) {
-          allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
-          rawMediaMap.set(sent.key.id, sent);
-          rawMediaMap.set(stkId, sent);
-        }
-
-        const ts = Math.floor(Date.now() / 1000);
-        const timeStr = formatearHoraMensaje(ts);
-        const timeRel = formatearHora(ts);
-
-        const newMsgItem = {
-          id: stkId,
-          fromMe: true,
-          sender: myName || "Tú",
-          text: "[Sticker]",
-          tipo: "sticker",
-          time: timeStr,
-          timestamp: ts,
-          status: 2,
-          read: false
-        };
-
-        if (!messagesCache.has(targetChat)) messagesCache.set(targetChat, []);
-        messagesCache.get(targetChat).push(newMsgItem);
-        if (messagesCache.get(targetChat).length > 50) messagesCache.get(targetChat).shift();
-
-        if (chatsCache.has(targetChat)) {
-          const c = chatsCache.get(targetChat);
-          c.lastMsg = "[Sticker]";
-          c.time = timeRel;
-          c.timestamp = ts;
-          c.fromMe = true;
-          c.unread = 0;
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
-      } catch (err) {
-        console.error("[Sticker] Error enviando sticker:", err.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: err.message }));
+        } catch (_) {}
       }
-    });
-    return;
+
+      if (!webpBuf) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Sticker invalido: debe enviar 8192 bytes o id existente" }));
+      }
+
+      const myJid = obtenerMiJid();
+      const targetChat = esChatPropio(chat)
+        ? (sock?.user?.id ? jidNormalizedUser(sock.user.id) : myJid)
+        : jidNormalizedUser(chat);
+
+      const sent = await sock.sendMessage(targetChat, {
+        sticker: webpBuf
+      });
+
+      const msgId = sent?.key?.id || ("stkmsg_" + Date.now());
+      if (sent?.key?.id) {
+        allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
+        rawMediaMap.set(sent.key.id, sent);
+      }
+      rawMediaMap.set(stkId, sent);
+      if (msgId !== stkId) rawMediaMap.set(msgId, sent);
+
+      const ts = Math.floor(Date.now() / 1000);
+      const timeStr = formatearHoraMensaje(ts);
+      const timeRel = formatearHora(ts);
+
+      const newMsgItem = {
+        id: msgId,
+        stickerId: stkId,
+        fromMe: true,
+        sender: myName || "Tú",
+        text: "[Sticker]",
+        tipo: "sticker",
+        time: timeStr,
+        timestamp: ts,
+        status: 2,
+        read: false
+      };
+
+      if (!messagesCache.has(targetChat)) messagesCache.set(targetChat, []);
+      messagesCache.get(targetChat).push(newMsgItem);
+      if (messagesCache.get(targetChat).length > 50) messagesCache.get(targetChat).shift();
+
+      if (chatsCache.has(targetChat)) {
+        const c = chatsCache.get(targetChat);
+        c.lastMsg = "[Sticker]";
+        c.time = timeRel;
+        c.timestamp = ts;
+        c.fromMe = true;
+        c.unread = 0;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, id: msgId, stickerId: stkId }));
+    } catch (err) {
+      console.error("[Sticker] Error enviando sticker:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
   }
 
   res.writeHead(404);
@@ -2114,22 +2433,20 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[EspCHAT Bridge v2.8.2] Activo en puerto ${PORT}`);
-  startWhatsApp();
+  console.log(`[EspCHAT Bridge v3.4.0] Activo en puerto ${PORT}`);
+  if (!SKIP_WA) {
+    startWhatsApp();
+  }
 
-  // Keep-Alive auto-ping cada 9 minutos para prevenir suspension en Render Free
-  setInterval(() => {
-    try {
-      const sUrl = process.env.RENDER_EXTERNAL_URL || "https://espos-chat-bridge.onrender.com";
-      const pingUrl = `${sUrl}/api/status`;
-      const mod = pingUrl.startsWith("https") ? require("https") : require("http");
-      mod.get(pingUrl, (r) => { r.on("data", () => {}); }).on("error", () => {});
-    } catch (e) {}
-  }, 9 * 60 * 1000);
+  // Keep-Alive auto-ping cada 9 minutos solo en entorno Cloud y sin SKIP_WA
+  if (IS_CLOUD && !SKIP_WA) {
+    setInterval(() => {
+      try {
+        const sUrl = process.env.RENDER_EXTERNAL_URL || "https://espos-chat-bridge.onrender.com";
+        const pingUrl = `${sUrl}/`;
+        const mod = pingUrl.startsWith("https") ? require("https") : require("http");
+        mod.get(pingUrl, (r) => { r.on("data", () => {}); }).on("error", () => {});
+      } catch (e) {}
+    }, 9 * 60 * 1000);
+  }
 });
-if (String(PORT) !== "3000") {
-  try {
-    const s3000 = http.createServer(server.listeners("request")[0]);
-    s3000.listen(3000, "0.0.0.0");
-  } catch (e) {}
-}
