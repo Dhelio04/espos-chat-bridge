@@ -105,12 +105,16 @@ function verificarApiKey(req) {
 const MAX_AUTH_FAILS = 10;
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
 const AUTH_BLOCK_MS = 15 * 60 * 1000;
+const MAX_FAILED_IPS = 5000;
 const failedAuthByIp = new Map(); // ip -> { count, firstFailAt, blockedUntil }
 
 function obtenerIpCliente(req) {
-  const xff = req.headers["x-forwarded-for"];
-  if (typeof xff === "string" && xff.trim()) {
-    return xff.split(",")[0].trim();
+  if (IS_CLOUD) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.trim()) {
+      const partes = xff.split(",").map(s => s.trim()).filter(Boolean);
+      if (partes.length > 0) return partes[partes.length - 1];
+    }
   }
   return req.socket?.remoteAddress || "unknown";
 }
@@ -135,6 +139,10 @@ function registrarFalloAuth(ip) {
   const now = Date.now();
   let entry = failedAuthByIp.get(ip);
   if (!entry || (now - entry.firstFailAt > AUTH_WINDOW_MS && !entry.blockedUntil)) {
+    if (!entry && failedAuthByIp.size >= MAX_FAILED_IPS) {
+      const oldestKey = failedAuthByIp.keys().next().value;
+      if (oldestKey !== undefined) failedAuthByIp.delete(oldestKey);
+    }
     entry = { count: 1, firstFailAt: now, blockedUntil: 0 };
     failedAuthByIp.set(ip, entry);
     return;
@@ -2431,6 +2439,12 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404);
   res.end();
 });
+
+// Timeouts HTTP estrictos anti-Slowloris
+server.headersTimeout = 10000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+server.maxHeadersCount = 40;
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[EspCHAT Bridge v3.4.0] Activo en puerto ${PORT}`);
