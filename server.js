@@ -221,20 +221,182 @@ function responderErrorBody(res, req, err) {
   return res.end(JSON.stringify({ ok: false, error: err?.message || "Solicitud invalida" }));
 }
 
-// Purgar cache de stickers antiguos generados con stride incorrecto
-try {
-  if (fs.existsSync(stickersFolder)) {
-    const sFiles = fs.readdirSync(stickersFolder);
-    for (const f of sFiles) {
-      try { fs.unlinkSync(path.join(stickersFolder, f)); } catch (_) {}
+// Limpieza LRU no destructiva de stickers_cache (maximo 200 stickers = 400 archivos .raw/.webp)
+function limpiarCacheStickersLRU(maxStickers = 200, logIfClean = false) {
+  try {
+    if (!fs.existsSync(stickersFolder)) return;
+    const entries = fs.readdirSync(stickersFolder);
+    const maxFiles = Math.max(1, Number(maxStickers) || 200) * 2;
+    const validFiles = [];
+    let malformedRemoved = 0;
+
+    for (const name of entries) {
+      const fullPath = path.join(stickersFolder, name);
+      try {
+        const st = fs.statSync(fullPath);
+        if (!st.isFile()) continue;
+        if (name.endsWith(".raw") && st.size !== 64 * 64 * 2) {
+          try {
+            fs.unlinkSync(fullPath);
+            malformedRemoved++;
+          } catch (_) {}
+          continue;
+        }
+        validFiles.push({ name, fullPath, mtimeMs: st.mtimeMs || st.ctimeMs || 0 });
+      } catch (_) {}
     }
-    console.log(`[Stickers] Cache purgado al iniciar (${sFiles.length} stickers limpiados)`);
+
+    let lruRemoved = 0;
+    if (validFiles.length > maxFiles) {
+      validFiles.sort((a, b) => a.mtimeMs - b.mtimeMs);
+      const excess = validFiles.length - maxFiles;
+      for (let i = 0; i < excess; i++) {
+        try {
+          fs.unlinkSync(validFiles[i].fullPath);
+          lruRemoved++;
+        } catch (_) {}
+      }
+    }
+
+    if (malformedRemoved > 0 || lruRemoved > 0) {
+      console.log(`[Stickers] Cache LRU limpiado: ${malformedRemoved} .raw malformados eliminados, ${lruRemoved} archivos antiguos purgados (${validFiles.length - lruRemoved} conservados)`);
+    } else if (logIfClean) {
+      console.log(`[Stickers] Cache LRU verificado al iniciar (${validFiles.length} archivos conservados)`);
+    }
+  } catch (e) {
+    console.warn("[Stickers] Error en limpieza LRU de cache:", e.message);
   }
-} catch (e) {
-  console.warn("[Stickers] Error purgando cache:", e.message);
+}
+limpiarCacheStickersLRU(200, true);
+
+let ultimaLimpiezaStickersMs = Date.now();
+function verificarLimpiezaStickersLRU() {
+  const ahora = Date.now();
+  if (ahora - ultimaLimpiezaStickersMs < 5 * 60 * 1000) return;
+  ultimaLimpiezaStickersMs = ahora;
+  limpiarCacheStickersLRU(200, false);
 }
 
-const rawMediaMap = new Map(); // msgId -> WAMessage
+const MAX_RAW_MEDIA = 500;
+const rawMediaMap = new Map(); // msgId / stickerId -> WAMessage
+
+function registrarMediaEnMapa(key, msg) {
+  if (!key || !msg) return;
+  if (rawMediaMap.has(key)) rawMediaMap.delete(key);
+  rawMediaMap.set(key, msg);
+  while (rawMediaMap.size > MAX_RAW_MEDIA) {
+    const k = rawMediaMap.keys().next().value;
+    rawMediaMap.delete(k);
+  }
+}
+
+function extraerMensajeInterno(rawMsg) {
+  let inner = rawMsg?.message || rawMsg;
+  if (inner?.ephemeralMessage?.message) inner = inner.ephemeralMessage.message;
+  if (inner?.viewOnceMessage?.message) inner = inner.viewOnceMessage.message;
+  if (inner?.viewOnceMessageV2?.message) inner = inner.viewOnceMessageV2.message;
+  if (inner?.documentWithCaptionMessage?.message) inner = inner.documentWithCaptionMessage.message;
+  return inner;
+}
+
+function extraerStickerId(stickerMsg, fallbackId = "") {
+  try {
+    const sha = stickerMsg?.fileSha256;
+    if (sha) {
+      let buf = null;
+      if (Buffer.isBuffer(sha) || sha instanceof Uint8Array || Array.isArray(sha)) {
+        buf = Buffer.from(sha);
+      } else if (Array.isArray(sha?.data)) {
+        buf = Buffer.from(sha.data);
+      } else if (typeof sha === "string" && sha.length > 0) {
+        buf = Buffer.from(sha, "base64");
+      } else if (typeof sha === "object") {
+        const numKeys = Object.keys(sha)
+          .filter(k => /^\d+$/.test(k))
+          .sort((a, b) => Number(a) - Number(b));
+        if (numKeys.length > 0) buf = Buffer.from(numKeys.map(k => sha[k]));
+      }
+      if (buf && buf.length > 0) {
+        return buf.toString("hex").substring(0, 32);
+      }
+    }
+  } catch (_) {}
+  return fallbackId ? String(fallbackId).replace(/[^a-zA-Z0-9_-]/g, "_") : "";
+}
+
+function indexarStickerEnMapa(msg, extraIds = []) {
+  if (!msg) return "";
+  const inner = extraerMensajeInterno(msg);
+  const msgKeyId = msg?.key?.id ? String(msg.key.id) : "";
+  const safeKeyId = msgKeyId ? msgKeyId.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
+  const sId = inner?.stickerMessage ? extraerStickerId(inner.stickerMessage, msgKeyId) : "";
+
+  if (msgKeyId) registrarMediaEnMapa(msgKeyId, msg);
+  if (safeKeyId && safeKeyId !== msgKeyId) registrarMediaEnMapa(safeKeyId, msg);
+  if (sId) registrarMediaEnMapa(sId, msg);
+  for (const extra of extraIds) {
+    if (typeof extra === "string" && extra.trim()) {
+      registrarMediaEnMapa(extra.trim(), msg);
+    }
+  }
+  return sId;
+}
+
+async function convertirStickerARgb565(mediaBuf) {
+  if (!sharp || !mediaBuf) return null;
+  const resObj = await sharp(mediaBuf, { page: 0 })
+    .resize(64, 64, { fit: "contain", background: { r: 16, g: 24, b: 32, alpha: 0 } })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const data = resObj.data;
+  const channels = resObj.info.channels || 4;
+  const rgb565 = Buffer.alloc(64 * 64 * 2);
+  for (let i = 0; i < 64 * 64; i++) {
+    const off = i * channels;
+    const r = data[off];
+    const g = data[off + 1];
+    const b = data[off + 2];
+    const a = channels >= 4 ? data[off + 3] : 255;
+    if (a < 64) {
+      rgb565.writeUInt16LE(0x10C4, i * 2);
+    } else {
+      let c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+      if (c16 === 0x10C4) c16 = 0x10E4;
+      else if (c16 === 0x0000) c16 = 0x0821;
+      else if (c16 === 0x1184) c16 = 0x11A4;
+      rgb565.writeUInt16LE(c16, i * 2);
+    }
+  }
+  return rgb565;
+}
+
+async function convertirRawAWebp(rawBuf) {
+  if (!sharp || !Buffer.isBuffer(rawBuf) || rawBuf.length !== 64 * 64 * 2) return null;
+  const rgbaBuf = Buffer.alloc(64 * 64 * 4);
+  for (let i = 0; i < 64 * 64; i++) {
+    const c16 = rawBuf.readUInt16LE(i * 2);
+    if (c16 === 0x10C4 || c16 === 0x0000 || c16 === 0x1184) {
+      rgbaBuf[i * 4] = 0;
+      rgbaBuf[i * 4 + 1] = 0;
+      rgbaBuf[i * 4 + 2] = 0;
+      rgbaBuf[i * 4 + 3] = 0;
+    } else {
+      const r = ((c16 >> 11) & 0x1F) * 255 / 31;
+      const g = ((c16 >> 5) & 0x3F) * 255 / 63;
+      const b = (c16 & 0x1F) * 255 / 31;
+      rgbaBuf[i * 4] = Math.round(r);
+      rgbaBuf[i * 4 + 1] = Math.round(g);
+      rgbaBuf[i * 4 + 2] = Math.round(b);
+      rgbaBuf[i * 4 + 3] = 255;
+    }
+  }
+  return sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
+    .resize(256, 256, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .webp({ quality: 90 })
+    .toBuffer();
+}
 const allMessagesMap = new Map(); // msgId -> raw WAMessage
 const groupMetaCache = new Map(); // jid -> { announce: boolean, soloAdmins: boolean, ts: number }
 const estadosMap = new Map(); // id -> item (declarado antes de cargarStoreDisco para evitar TDZ)
@@ -358,9 +520,16 @@ function cargarStoreDisco() {
           }
         }
       }
+      if (Array.isArray(data.llamadas)) {
+        callsList = data.llamadas.slice(0, 20);
+      }
       if (data.rawMedia) {
         for (const [k, v] of Object.entries(data.rawMedia)) {
-          rawMediaMap.set(k, v);
+          registrarMediaEnMapa(k, v);
+          const inner = extraerMensajeInterno(v);
+          if (inner?.stickerMessage) {
+            indexarStickerEnMapa(v, [k]);
+          }
         }
       }
       console.log(`[Store] Restaurado desde disco: ${chatsCache.size} chats, ${messagesCache.size} historiales, ${contactsMap.size} contactos.`);
@@ -424,6 +593,7 @@ function programarGuardadoDisco() {
         chats: Object.fromEntries(chatsCache.entries()),
         messages: msgsFrescos,
         estados: estadosValidos,
+        llamadas: callsList.slice(0, 20),
         rawMedia: Object.fromEntries(Array.from(rawMediaMap.entries()).slice(-100))
       };
       fs.writeFileSync(storeFile, JSON.stringify(payload));
@@ -663,7 +833,7 @@ function procesarEstado(msg, esEnVivo = true) {
       tipo = "foto";
       esFoto = true;
       texto = innerMsg.imageMessage.caption ? "[Foto] " + innerMsg.imageMessage.caption : "[Foto]";
-      rawMediaMap.set(id, msg);
+      registrarMediaEnMapa(id, msg);
       if (innerMsg.imageMessage.jpegThumbnail) {
         try {
           const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
@@ -676,7 +846,7 @@ function procesarEstado(msg, esEnVivo = true) {
       tipo = "video";
       esFoto = true;
       texto = innerMsg.videoMessage.caption ? "[Foto] " + innerMsg.videoMessage.caption : "[Foto con musica]";
-      rawMediaMap.set(id, msg);
+      registrarMediaEnMapa(id, msg);
       if (innerMsg.videoMessage.jpegThumbnail) {
         try {
           const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
@@ -752,47 +922,35 @@ function procesarMensaje(msg, esEnVivo = true) {
 
   let sId = "";
   if (msg.key?.id && (innerMsg?.stickerMessage || innerMsg?.audioMessage || innerMsg?.imageMessage || innerMsg?.videoMessage)) {
-    rawMediaMap.set(msg.key.id, msg);
     if (innerMsg?.stickerMessage) {
-      sId = msg.key.id.replace(/[^a-zA-Z0-9_-]/g, "_");
-      if (innerMsg.stickerMessage.fileSha256) {
-        sId = Buffer.from(innerMsg.stickerMessage.fileSha256).toString("hex").substring(0, 32);
-      }
-      if (sId !== msg.key.id) rawMediaMap.set(sId, msg);
-    }
-    while (rawMediaMap.size > 500) {
-      const k = rawMediaMap.keys().next().value;
-      rawMediaMap.delete(k);
+      sId = indexarStickerEnMapa(msg);
+    } else {
+      registrarMediaEnMapa(msg.key.id, msg);
     }
     // Precarga asincrona inmediata de stickers a formato RGB565 One UI (Deduplicacion SHA256)
     if (innerMsg?.stickerMessage && sharp && esEnVivo && sId) {
       const rPath = path.join(stickersFolder, `${sId}.raw`);
-      if (!fs.existsSync(rPath)) {
-        downloadMediaMessage(msg, "buffer", {}, {
-          logger: pino({ level: "silent" }),
-          reuploadRequest: sock?.updateMediaMessage
-        }).then(buf => {
-          if (buf) {
-            try { fs.writeFileSync(path.join(stickersFolder, `${sId}.webp`), buf); } catch (_) {}
-            return sharp(buf, { page: 0 })
-              .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
-              .flatten({ background: { r: 19, g: 27, b: 36 } })
-              .raw()
-              .toBuffer({ resolveWithObject: true });
+      const wPath = path.join(stickersFolder, `${sId}.webp`);
+      let faltaRaw = !fs.existsSync(rPath);
+      if (!faltaRaw) {
+        try { faltaRaw = fs.statSync(rPath).size !== 64 * 64 * 2; } catch (_) { faltaRaw = true; }
+      }
+      if (faltaRaw) {
+        const leerODescargar = fs.existsSync(wPath)
+          ? Promise.resolve(fs.readFileSync(wPath))
+          : downloadMediaMessage(msg, "buffer", {}, {
+              logger: pino({ level: "silent" }),
+              reuploadRequest: sock?.updateMediaMessage
+            });
+        leerODescargar.then(async buf => {
+          if (!buf) return;
+          if (!fs.existsSync(wPath)) {
+            try { fs.writeFileSync(wPath, buf); } catch (_) {}
           }
-        }).then(resObj => {
-          if (resObj && resObj.data) {
-            const data = resObj.data;
-            const channels = resObj.info.channels || 3;
-            const rgb565 = Buffer.alloc(64 * 64 * 2);
-            for (let i = 0; i < 64 * 64; i++) {
-              const r = data[i * channels];
-              const g = data[i * channels + 1];
-              const b = data[i * channels + 2];
-              const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-              rgb565.writeUInt16LE(c16, i * 2);
-            }
+          const rgb565 = await convertirStickerARgb565(buf);
+          if (rgb565 && rgb565.length === 64 * 64 * 2) {
             fs.writeFileSync(rPath, rgb565);
+            verificarLimpiezaStickersLRU();
           }
         }).catch(() => {});
       }
@@ -1216,6 +1374,7 @@ async function startWhatsApp() {
         });
         if (callsList.length > 20) callsList.pop();
       }
+      if (calls.length > 0) programarGuardadoDisco();
     });
   } catch (err) {
     console.error("[WhatsApp] Error critico en startWhatsApp:", err);
@@ -1872,49 +2031,89 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/api/sticker" && req.method === "GET") {
-    const msgId = parsedUrl.query.id;
+    const msgId = typeof parsedUrl.query.id === "string" ? parsedUrl.query.id.trim() : "";
     if (!msgId) { res.writeHead(400); return res.end(); }
     try {
       const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, "_");
       const rawPath = path.join(stickersFolder, `${safeId}.raw`);
+      const webpPath = path.join(stickersFolder, `${safeId}.webp`);
       if (fs.existsSync(rawPath)) {
         const rawBuf = fs.readFileSync(rawPath);
         if (rawBuf.length === 64 * 64 * 2) {
+          try { const now = new Date(); fs.utimesSync(rawPath, now, now); } catch (_) {}
           res.writeHead(200, {
             "Content-Type": "application/octet-stream",
             "Content-Length": rawBuf.length
           });
           return res.end(rawBuf);
         }
+        try { fs.unlinkSync(rawPath); } catch (_) {}
       }
-      const rawMsg = rawMediaMap.get(msgId);
-      if (!rawMsg) { res.writeHead(404); return res.end("Sticker no en memoria"); }
-      if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
 
-      const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-        logger: pino({ level: "silent" }),
-        reuploadRequest: sock?.updateMediaMessage
-      });
-      if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
-      try { fs.writeFileSync(path.join(stickersFolder, `${safeId}.webp`), mediaBuf); } catch (_) {}
+      const rawMsg = rawMediaMap.get(msgId) || rawMediaMap.get(safeId);
+      const innerStk = rawMsg ? extraerMensajeInterno(rawMsg)?.stickerMessage : null;
+      const canonId = innerStk ? extraerStickerId(innerStk, rawMsg?.key?.id || safeId) : "";
 
-      const resObj = await sharp(mediaBuf, { page: 0 })
-        .resize(64, 64, { fit: "contain", background: { r: 19, g: 27, b: 36, alpha: 1 } })
-        .flatten({ background: { r: 19, g: 27, b: 36 } })
-        .raw()
-        .toBuffer({ resolveWithObject: true });
+      if (canonId && canonId !== safeId) {
+        const canonRawPath = path.join(stickersFolder, `${canonId}.raw`);
+        if (fs.existsSync(canonRawPath)) {
+          const canonBuf = fs.readFileSync(canonRawPath);
+          if (canonBuf.length === 64 * 64 * 2) {
+            try { const now = new Date(); fs.utimesSync(canonRawPath, now, now); } catch (_) {}
+            res.writeHead(200, {
+              "Content-Type": "application/octet-stream",
+              "Content-Length": canonBuf.length
+            });
+            return res.end(canonBuf);
+          }
+          try { fs.unlinkSync(canonRawPath); } catch (_) {}
+        }
+      }
 
-      const data = resObj.data;
-      const channels = resObj.info.channels || 3;
-      const rgb565 = Buffer.alloc(64 * 64 * 2);
-      for (let i = 0; i < 64 * 64; i++) {
-        const r = data[i * channels];
-        const g = data[i * channels + 1];
-        const b = data[i * channels + 2];
-        const c16 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-        rgb565.writeUInt16LE(c16, i * 2);
+      let mediaBuf = null;
+      if (fs.existsSync(webpPath)) {
+        try {
+          const buf = fs.readFileSync(webpPath);
+          if (buf.length > 0) mediaBuf = buf;
+        } catch (_) {}
+      }
+      if (!mediaBuf && canonId && canonId !== safeId) {
+        const canonWebpPath = path.join(stickersFolder, `${canonId}.webp`);
+        if (fs.existsSync(canonWebpPath)) {
+          try {
+            const buf = fs.readFileSync(canonWebpPath);
+            if (buf.length > 0) mediaBuf = buf;
+          } catch (_) {}
+        }
+      }
+
+      if (!mediaBuf) {
+        if (!rawMsg) { res.writeHead(404); return res.end("Sticker no en memoria"); }
+        if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
+        mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+          logger: pino({ level: "silent" }),
+          reuploadRequest: sock?.updateMediaMessage
+        });
+        if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
+        try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
+        if (canonId && canonId !== safeId) {
+          try { fs.writeFileSync(path.join(stickersFolder, `${canonId}.webp`), mediaBuf); } catch (_) {}
+        }
+      } else if (!sharp) {
+        res.writeHead(503);
+        return res.end("Sharp no disponible");
+      }
+
+      const rgb565 = await convertirStickerARgb565(mediaBuf);
+      if (!rgb565 || rgb565.length !== 64 * 64 * 2) {
+        res.writeHead(500);
+        return res.end();
       }
       fs.writeFileSync(rawPath, rgb565);
+      if (canonId && canonId !== safeId) {
+        try { fs.writeFileSync(path.join(stickersFolder, `${canonId}.raw`), rgb565); } catch (_) {}
+      }
+      verificarLimpiezaStickersLRU();
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
         "Content-Length": rgb565.length
@@ -2120,44 +2319,49 @@ const server = http.createServer(async (req, res) => {
       }
       let sent;
       let isStk = false;
+      let rawStkParam = "";
+      let stkId = "";
       const stkMatch = (typeof texto === "string") ? texto.match(/^\[Sticker:(.+)\]$/) : null;
       if (stkMatch) {
         isStk = true;
-        const stkId = stkMatch[1].replace(/[^a-zA-Z0-9_-]/g, "_");
-        const webpPath = path.join(stickersFolder, `${stkId}.webp`);
-        const rawPath = path.join(stickersFolder, `${stkId}.raw`);
-        if (fs.existsSync(webpPath)) {
-          sent = await sock.sendMessage(chat, { sticker: fs.readFileSync(webpPath) });
-        } else if (rawMediaMap.has(stkId)) {
-          try {
-            const rawMsg = rawMediaMap.get(stkId);
-            const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-              logger: pino({ level: "silent" }),
-              reuploadRequest: sock?.updateMediaMessage
-            });
-            if (mediaBuf) {
-              try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
-              sent = await sock.sendMessage(chat, { sticker: mediaBuf });
+        rawStkParam = stkMatch[1].trim();
+        stkId = rawStkParam.replace(/[^a-zA-Z0-9_-]/g, "_");
+        if (stkId) {
+          const webpPath = path.join(stickersFolder, `${stkId}.webp`);
+          const rawPath = path.join(stickersFolder, `${stkId}.raw`);
+          if (fs.existsSync(webpPath)) {
+            try {
+              const cachedWebp = fs.readFileSync(webpPath);
+              if (cachedWebp.length > 0) {
+                sent = await sock.sendMessage(chat, { sticker: cachedWebp });
+              }
+            } catch (_) {}
+          }
+          if (!sent) {
+            const rawMsg = rawMediaMap.get(rawStkParam) || rawMediaMap.get(stkId);
+            if (rawMsg) {
+              try {
+                const mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+                  logger: pino({ level: "silent" }),
+                  reuploadRequest: sock?.updateMediaMessage
+                });
+                if (mediaBuf && mediaBuf.length > 0) {
+                  try { fs.writeFileSync(webpPath, mediaBuf); } catch (_) {}
+                  sent = await sock.sendMessage(chat, { sticker: mediaBuf });
+                }
+              } catch (_) {}
             }
-          } catch (_) {}
-        }
-        if (!sent && fs.existsSync(rawPath) && sharp) {
-          try {
-            const rawBuf = fs.readFileSync(rawPath);
-            const rgbaBuf = Buffer.alloc(64 * 64 * 4);
-            for (let i = 0; i < 64 * 64; i++) {
-              const c16 = rawBuf.readUInt16LE(i * 2);
-              const r = ((c16 >> 11) & 0x1F) * 255 / 31;
-              const g = ((c16 >> 5) & 0x3F) * 255 / 63;
-              const b = (c16 & 0x1F) * 255 / 31;
-              rgbaBuf[i * 4] = Math.round(r);
-              rgbaBuf[i * 4 + 1] = Math.round(g);
-              rgbaBuf[i * 4 + 2] = Math.round(b);
-              rgbaBuf[i * 4 + 3] = 255;
-            }
-            const webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } }).webp().toBuffer();
-            sent = await sock.sendMessage(chat, { sticker: webpBuf });
-          } catch (_) {}
+          }
+          if (!sent && fs.existsSync(rawPath) && sharp) {
+            try {
+              const rawBuf = fs.readFileSync(rawPath);
+              const webpBuf = await convertirRawAWebp(rawBuf);
+              if (webpBuf) {
+                try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {}
+                sent = await sock.sendMessage(chat, { sticker: webpBuf });
+              }
+            } catch (_) {}
+          }
         }
         if (!sent) {
           res.writeHead(404, { "Content-Type": "application/json" });
@@ -2167,15 +2371,27 @@ const server = http.createServer(async (req, res) => {
         sent = await sock.sendMessage(chat, { text: texto });
       }
       const displayTxt = isStk ? "[Sticker]" : texto;
+      const sentMsgId = sent?.key?.id || ((isStk ? "stkmsg_" : "msg_") + Date.now());
       if (sent?.key?.id) {
-        allMessagesMap.set(sent.key.id, sent.message || { conversation: texto });
+        allMessagesMap.set(sent.key.id, sent.message || (isStk ? { stickerMessage: {} } : { conversation: texto }));
+      }
+      if (isStk && sent) {
+        const sentSId = indexarStickerEnMapa(sent, rawStkParam ? [rawStkParam, stkId, sentMsgId] : [stkId, sentMsgId]);
+        if (sentSId && sentSId !== stkId) {
+          const srcWebp = path.join(stickersFolder, `${stkId}.webp`);
+          const dstWebp = path.join(stickersFolder, `${sentSId}.webp`);
+          if (fs.existsSync(srcWebp) && !fs.existsSync(dstWebp)) {
+            try { fs.copyFileSync(srcWebp, dstWebp); } catch (_) {}
+          }
+        }
+        verificarLimpiezaStickersLRU();
       }
       const ts = Math.floor(Date.now() / 1000);
       const timeStr = formatearHoraMensaje(ts);
       const timeRel = formatearHora(ts);
 
       const newMsgItem = {
-        id: sent.key.id,
+        id: sentMsgId,
         fromMe: true,
         sender: myName || "Tú",
         text: displayTxt,
@@ -2184,6 +2400,10 @@ const server = http.createServer(async (req, res) => {
         status: 2,
         read: false
       };
+      if (isStk) {
+        newMsgItem.tipo = "sticker";
+        newMsgItem.stickerId = stkId;
+      }
 
       if (!messagesCache.has(chat)) messagesCache.set(chat, []);
       messagesCache.get(chat).push(newMsgItem);
@@ -2205,8 +2425,9 @@ const server = http.createServer(async (req, res) => {
         c.unread = 0;
       }
 
+      programarGuardadoDisco();
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, id: sent.key.id }));
+      return res.end(JSON.stringify({ ok: true, id: sentMsgId }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -2237,8 +2458,11 @@ const server = http.createServer(async (req, res) => {
       const outOgg = path.join(audioFolder, `out_${tmpId}.ogg`);
       fs.writeFileSync(inWav, audioBuf);
 
+      const ffmpegBin = (() => {
+        try { return require("ffmpeg-static") || "ffmpeg"; } catch (_) { return "ffmpeg"; }
+      })();
       const transcodeToOpus = (codec) => new Promise((resolve, reject) => {
-        execFile("ffmpeg", ["-y", "-i", inWav, "-c:a", codec, "-b:a", "32k", "-vbr", "on", "-application", "voip", outOgg], (err) => {
+        execFile(ffmpegBin, ["-y", "-i", inWav, "-ar", "16000", "-ac", "1", "-c:a", codec, "-b:a", "32k", "-vbr", "on", "-application", "voip", outOgg], (err) => {
           if (err) return reject(err);
           if (!fs.existsSync(outOgg) || fs.statSync(outOgg).size === 0) return reject(new Error("Ogg vacio"));
           resolve(fs.readFileSync(outOgg));
@@ -2267,10 +2491,15 @@ const server = http.createServer(async (req, res) => {
         : jidNormalizedUser(chat);
 
       const isOgg = (oggBuf !== audioBuf);
-      const sent = await sock.sendMessage(targetChat, {
+      // Nunca enviar WAV crudo disfrazado de audio/mp4 con ptt:true (WhatsApp lo rechaza como incompatible)
+      const sent = await sock.sendMessage(targetChat, isOgg ? {
         audio: oggBuf,
-        mimetype: isOgg ? "audio/ogg; codecs=opus" : "audio/mp4",
+        mimetype: "audio/ogg; codecs=opus",
         ptt: true
+      } : {
+        audio: oggBuf,
+        mimetype: "audio/wav",
+        ptt: false
       });
       if (sent?.key?.id) {
         allMessagesMap.set(sent.key.id, sent.message);
@@ -2328,7 +2557,8 @@ const server = http.createServer(async (req, res) => {
       return responderErrorBody(res, req, err);
     }
     const chat = parsedUrl.query.chat;
-    const stkId = (parsedUrl.query.id || ("stk_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const rawQueryId = typeof parsedUrl.query.id === "string" ? parsedUrl.query.id.trim() : "";
+    const stkId = (rawQueryId || ("stk_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "_");
     if (!chat || !sock) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Falta parametro chat o no conectado" }));
@@ -2338,39 +2568,51 @@ const server = http.createServer(async (req, res) => {
       const rawPath = path.join(stickersFolder, `${stkId}.raw`);
       let webpBuf = null;
 
-      if (rawBuf.length === 64 * 64 * 2) {
-        const rgbaBuf = Buffer.alloc(64 * 64 * 4);
-        for (let i = 0; i < 64 * 64; i++) {
-          const c16 = rawBuf.readUInt16LE(i * 2);
-          const r = ((c16 >> 11) & 0x1F) * 255 / 31;
-          const g = ((c16 >> 5) & 0x3F) * 255 / 63;
-          const b = (c16 & 0x1F) * 255 / 31;
-          rgbaBuf[i * 4] = Math.round(r);
-          rgbaBuf[i * 4 + 1] = Math.round(g);
-          rgbaBuf[i * 4 + 2] = Math.round(b);
-          rgbaBuf[i * 4 + 3] = (c16 === 0x0000 || c16 === 0x1184) ? 0 : 255;
+      if (rawQueryId && fs.existsSync(webpPath)) {
+        const sameRawOnDisk = (rawBuf.length === 64 * 64 * 2 && fs.existsSync(rawPath))
+          ? (() => { try { return fs.readFileSync(rawPath).equals(rawBuf); } catch (_) { return false; } })()
+          : true;
+        if (sameRawOnDisk) {
+          try {
+            const cachedWebp = fs.readFileSync(webpPath);
+            if (cachedWebp.length > 0) webpBuf = cachedWebp;
+          } catch (_) {}
+          if (rawBuf.length === 64 * 64 * 2 && !fs.existsSync(rawPath)) {
+            try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
+          }
         }
+      }
 
-        if (sharp) {
-          webpBuf = await sharp(rgbaBuf, { raw: { width: 64, height: 64, channels: 4 } })
-            .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-            .webp({ quality: 90 })
-            .toBuffer();
-        } else {
+      if (!webpBuf && rawBuf.length === 64 * 64 * 2) {
+        if (!sharp) {
           res.writeHead(500, { "Content-Type": "application/json" });
           return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
         }
+        webpBuf = await convertirRawAWebp(rawBuf);
         try { fs.writeFileSync(rawPath, rawBuf); } catch (_) {}
         if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
-      } else if (fs.existsSync(webpPath)) {
-        webpBuf = fs.readFileSync(webpPath);
-      } else if (rawMediaMap.has(stkId)) {
+      } else if (!webpBuf && fs.existsSync(webpPath)) {
         try {
-          const rawMsg = rawMediaMap.get(stkId);
+          const cachedWebp = fs.readFileSync(webpPath);
+          if (cachedWebp.length > 0) webpBuf = cachedWebp;
+        } catch (_) {}
+      } else if (!webpBuf && (rawMediaMap.has(rawQueryId) || rawMediaMap.has(stkId))) {
+        try {
+          const rawMsg = rawMediaMap.get(rawQueryId) || rawMediaMap.get(stkId);
           webpBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
             logger: pino({ level: "silent" }),
             reuploadRequest: sock?.updateMediaMessage
           });
+          if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
+        } catch (_) {}
+      } else if (!webpBuf && fs.existsSync(rawPath)) {
+        if (!sharp) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Sharp no disponible para conversion" }));
+        }
+        try {
+          const diskRaw = fs.readFileSync(rawPath);
+          webpBuf = await convertirRawAWebp(diskRaw);
           if (webpBuf) { try { fs.writeFileSync(webpPath, webpBuf); } catch (_) {} }
         } catch (_) {}
       }
@@ -2392,10 +2634,17 @@ const server = http.createServer(async (req, res) => {
       const msgId = sent?.key?.id || ("stkmsg_" + Date.now());
       if (sent?.key?.id) {
         allMessagesMap.set(sent.key.id, sent.message || { stickerMessage: {} });
-        rawMediaMap.set(sent.key.id, sent);
       }
-      rawMediaMap.set(stkId, sent);
-      if (msgId !== stkId) rawMediaMap.set(msgId, sent);
+      if (sent) {
+        const extraIds = rawQueryId ? [rawQueryId, stkId, msgId] : [stkId, msgId];
+        const sentSId = indexarStickerEnMapa(sent, extraIds);
+        if (sentSId && sentSId !== stkId) {
+          const sentWebpPath = path.join(stickersFolder, `${sentSId}.webp`);
+          if (!fs.existsSync(sentWebpPath)) {
+            try { fs.writeFileSync(sentWebpPath, webpBuf); } catch (_) {}
+          }
+        }
+      }
 
       const ts = Math.floor(Date.now() / 1000);
       const timeStr = formatearHoraMensaje(ts);
@@ -2427,6 +2676,8 @@ const server = http.createServer(async (req, res) => {
         c.unread = 0;
       }
 
+      verificarLimpiezaStickersLRU();
+      programarGuardadoDisco();
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true, id: msgId, stickerId: stkId }));
     } catch (err) {
